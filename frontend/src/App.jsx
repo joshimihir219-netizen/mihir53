@@ -21,11 +21,11 @@ const nav = [
   ["Risk Management", ShieldCheck], ["Reports", FileText], ["Strategies", Settings]
 ];
 const defaultStrategies = [
-  {name: "Opening Range Breakout", rule: "opening_range_breakout", risk: "High", status: "READY", description: "Breaks above the 09:15–09:30 IST range with volume confirmation; closes below range support or EMA20."},
-  {name: "VWAP Pullback", rule: "vwap_pullback", risk: "Medium", status: "READY", description: "Buys an intraday VWAP reclaim in an EMA20/EMA50 uptrend; exits on VWAP or trend loss."},
-  {name: "EMA Trend Pullback", rule: "ema_trend_pullback", risk: "Medium", status: "ACTIVE", description: "Enters a 20/50 EMA uptrend after a pullback and momentum confirmation; exits below EMA20."},
-  {name: "Donchian Breakout", rule: "donchian_breakout", risk: "High", status: "READY", description: "Breaks a prior 20-bar high with volume and trend confirmation; exits below a 10-bar low."},
-  {name: "Bollinger Reversal", rule: "bollinger_reversal", risk: "Medium", status: "READY", description: "Looks for a close back inside the lower Bollinger band with weak RSI; exits near the mean."}
+  {name: "Price Action Break & Retest", rule: "price_action_retest", risk: "Medium", status: "READY", description: "Prior 20-bar resistance breaks; the next bar retests the level and closes bullish above it. Exit below prior 10-bar support or EMA 20.", entryRules: ["Close above the highest high of the prior 20 completed bars.", "The following bar touches within 0.3% of the broken level and closes bullish above it."], exitRules: ["Close below the prior 10-bar low.", "Or close below EMA 20."]},
+  {name: "Smart Money Structure (SMC)", rule: "smc_order_block_retest", risk: "High", status: "READY", description: "A 20-bar structure break is followed by a retest of the last bearish candle's range within 10 bars. Exit below prior 10-bar support or EMA 20.", entryRules: ["Close above the prior 20-bar structure high.", "Within 10 bars, retest the last bearish candle range from the 5 bars before the break and close bullish above its midpoint."], exitRules: ["Setup expires after 10 bars or a close below the order-block low before entry.", "After entry, close below prior 10-bar support or EMA 20."]},
+  {name: "ICT Liquidity Sweep", rule: "ict_liquidity_sweep", risk: "High", status: "READY", description: "Sweep below the prior 20-bar low, then bullish displacement through the 5-bar high with a three-candle fair-value gap. Exit below support or EMA 20.", entryRules: ["Sweep below the prior 20-bar low and close back above it.", "Within the next 4 bars, bullish displacement closes above the prior 5-bar high and forms a three-candle fair-value gap."], exitRules: ["Close below the prior 10-bar low.", "Or close below EMA 20."]},
+  {name: "EMA Trend Pullback", rule: "ema_trend_pullback", risk: "Medium", status: "READY", description: "EMA 20 above EMA 50; a recent EMA 20 pullback closes bullish back above the average. Exit below EMA 20 or on trend loss.", entryRules: ["EMA 20 and price are above EMA 50.", "A low in the prior 3 bars touched EMA 20; current candle closes bullish above EMA 20."], exitRules: ["Close below EMA 20.", "Or EMA 20 falls below EMA 50."]},
+  {name: "Donchian Trend Breakout", rule: "donchian_breakout", risk: "High", status: "READY", description: "A close crosses the prior 20-bar high while EMA 20 is above EMA 50. Exit below prior 10-bar support or on trend loss.", entryRules: ["Close crosses above the highest high of the prior 20 completed bars.", "EMA 20 is above EMA 50."], exitRules: ["Close below the prior 10-bar low.", "Or EMA 20 falls below EMA 50."]}
 ];
 
 function toCurrency(value){
@@ -89,22 +89,6 @@ function createOptionsSignalMetadata(key){
   };
 }
 
-function getSignalPlan(symbol, market, signal){
-  const price = Number(market?.price || 0);
-  const direction = (signal?.signal || "HOLD").toUpperCase();
-  const entryFactor = direction === "BUY" ? 0.998 : direction === "SELL" ? 1.002 : 1;
-  const exitFactor = direction === "BUY" ? 1.022 : direction === "SELL" ? 0.978 : 1.01;
-  const stopLossFactor = direction === "BUY" ? 0.985 : direction === "SELL" ? 1.015 : 0.992;
-
-  return {
-    entry: price ? Number((price * entryFactor).toFixed(2)) : "—",
-    exit: price ? Number((price * exitFactor).toFixed(2)) : "—",
-    stopLoss: price ? Number((price * stopLossFactor).toFixed(2)) : "—",
-    symbol: symbol || "Market",
-    bias: direction === "BUY" ? "Bullish" : direction === "SELL" ? "Bearish" : "Neutral"
-  };
-}
-
 function formatMarketPrice(symbol, value){
   if (!Number.isFinite(value)) return "—";
   const isCrypto = ["BTC/USDT", "ETH/USDT"].includes(symbol);
@@ -128,9 +112,10 @@ function App(){
   const [market, setMarket] = useState(null);
   const [signal, setSignal] = useState(null);
   const [backtest, setBacktest] = useState(() => { try { return JSON.parse(localStorage.getItem("trademind-last-backtest") || "null"); } catch { return null; } });
+  const [backtestError, setBacktestError] = useState("");
   const [backtestForm, setBacktestForm] = useState({
     symbol: "NIFTY 50",
-    strategy: "Opening Range Breakout",
+    strategy: "Price Action Break & Retest",
     timeframe: "15m",
     durationValue: "5",
     durationUnit: "days",
@@ -400,19 +385,18 @@ function App(){
   }, [riskRules]);
 
   useEffect(() => {
-    if (!isLoggedIn || !market || !signal) return;
+    if (!isLoggedIn || !market?.live || !signal?.live) return;
     const direction = String(signal.signal || "").toUpperCase();
     if (!["BUY", "SELL", "HOLD"].includes(direction)) return;
 
-    const plan = getSignalPlan(symbol, market, signal);
     const now = new Date();
     const tradeDate = formatTradeDate(now);
     const localDateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    const currentPrice = Number(market.price);
+    const currentPrice = Number(signal.reference_price ?? market.price);
     if (!Number.isFinite(currentPrice) || currentPrice <= 0) return;
 
-    const notificationKey = `${symbol}:${localDateKey}:${direction}`;
-    const notificationMessage = `${symbol}: ${direction} signal on ${tradeDate}. Entry ${plan.entry}, Exit ${plan.exit}, Stop Loss ${plan.stopLoss}. Confidence ${signal.confidence || 0}%.`;
+    const notificationKey = `${symbol}:${signal.rule || selectedStrategy}:${chartInterval}:${localDateKey}:${direction}`;
+    const notificationMessage = `${symbol}: ${direction} · ${signal.strategy || selectedStrategy}. ${signal.rule_triggered || "No rule detail available."}`;
     const isNewMarketSignalNotification = !notifiedMarketSignalsRef.current.has(notificationKey);
     if (isNewMarketSignalNotification) {
       notifiedMarketSignalsRef.current.add(notificationKey);
@@ -426,17 +410,25 @@ function App(){
 
     let signalStates = {};
     let activeTrade = null;
-    const tradeStorageKey = `trademind-market-trade:${symbol}`;
+    const tradeStorageKey = `trademind-market-trade:${symbol}:${signal.rule || selectedStrategy}:${chartInterval}`;
+    const legacyTradeStorageKey = `trademind-market-trade:${symbol}`;
     try {
       signalStates = JSON.parse(localStorage.getItem("trademind-market-signal-directions") || "{}");
       if (!signalStates || typeof signalStates !== "object" || Array.isArray(signalStates)) signalStates = {};
       activeTrade = JSON.parse(localStorage.getItem(tradeStorageKey) || "null");
+      localStorage.removeItem(legacyTradeStorageKey);
     } catch {}
 
-    const directionChanged = signalStates[symbol] !== direction;
+    if (activeTrade?.model !== "rule-derived-v2") {
+      activeTrade = null;
+      try { localStorage.removeItem(tradeStorageKey); } catch {}
+    }
+
+    const signalDirectionKey = `${symbol}:${signal.rule || selectedStrategy}:${chartInterval}`;
+    const directionChanged = signalStates[signalDirectionKey] !== direction;
     let telegramMessage = "";
     let telegramKey = "";
-    const signalStatusKey = `${symbol}:${telegramConfig.chatId}:${telegramConfig.botToken.slice(-4)}:${localDateKey}:${direction}`;
+    const signalStatusKey = `${symbol}:${signal.rule || selectedStrategy}:${chartInterval}:${telegramConfig.chatId}:${telegramConfig.botToken.slice(-4)}:${localDateKey}:${direction}`;
     let deliveredSignalStates = {};
     try {
       deliveredSignalStates = JSON.parse(localStorage.getItem("trademind-telegram-signal-state") || "{}");
@@ -451,28 +443,36 @@ function App(){
     }
 
     if (directionChanged) {
-      signalStates[symbol] = direction;
+      signalStates[signalDirectionKey] = direction;
       try {
         localStorage.setItem("trademind-market-signal-directions", JSON.stringify(signalStates));
       } catch {}
 
       if (direction === "BUY" && !activeTrade) {
-        activeTrade = {
-          entryPrice: currentPrice,
-          openedAt: now.toISOString(),
-          targetPrice: currentPrice * 1.022,
-          stopPrice: currentPrice * 0.985,
-          lastProfitMilestone: 0
-        };
-        try { localStorage.setItem(tradeStorageKey, JSON.stringify(activeTrade)); } catch {}
+        const entryPrice = Number(signal.entry_price);
+        const targetPrice = Number(signal.target_price);
+        const stopPrice = Number(signal.stop_loss);
+        if ([entryPrice, targetPrice, stopPrice].every((value) => Number.isFinite(value) && value > 0)) {
+          activeTrade = {
+            model: "rule-derived-v2",
+            rule: signal.rule || selectedStrategy,
+            timeframe: chartInterval,
+            entryPrice,
+            openedAt: signal.bar_time || now.toISOString(),
+            targetPrice,
+            stopPrice,
+            lastProfitMilestone: 0
+          };
+          try { localStorage.setItem(tradeStorageKey, JSON.stringify(activeTrade)); } catch {}
+        }
       }
 
       if (direction === "BUY") {
-        telegramMessage = `${symbol} · BUY signal · ${tradeDate}\nSignal entry: ${formatMarketPrice(symbol, currentPrice)}\nTarget scenario: ${formatMarketPrice(symbol, activeTrade?.targetPrice || currentPrice * 1.022)}\nStop-loss scenario: ${formatMarketPrice(symbol, activeTrade?.stopPrice || currentPrice * 0.985)}\nConfidence: ${signal.confidence || 0}%\nInformational signal only. No order is placed and prices are not guaranteed.`;
+        telegramMessage = `${symbol} · BUY rule triggered · ${tradeDate}\n${signal.rule_triggered}\nReference close: ${formatMarketPrice(symbol, signal.entry_price)}\nTarget scenario: ${formatMarketPrice(symbol, signal.target_price)} · Stop scenario: ${formatMarketPrice(symbol, signal.stop_loss)}\nNo order was placed; these are rule-derived levels, not guaranteed fills.`;
       } else if (direction === "HOLD") {
         telegramMessage = activeTrade
           ? `${symbol} · HOLD existing BUY · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry (${formatMarketPrice(symbol, activeTrade.entryPrice)}): ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade.targetPrice)} · Stop: ${formatMarketPrice(symbol, activeTrade.stopPrice)}\nIndicative signal move only; actual P&L depends on your entry, quantity, and costs.`
-          : `${symbol} · HOLD / WAIT · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nNo active BUY signal is being tracked. Wait for a directional signal; no order was placed.`;
+          : `${symbol} · WAIT · ${tradeDate}\n${signal.rule_triggered}\nNo active entry setup; no order was placed.`;
       } else {
         telegramMessage = activeTrade
           ? `${symbol} · SELL / EXIT BUY signal · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry (${formatMarketPrice(symbol, activeTrade.entryPrice)}): ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nIndicative exit signal only; no order was placed.`
@@ -485,7 +485,7 @@ function App(){
       telegramKey = signalStatusKey;
     }
 
-    if (activeTrade && ["BUY", "HOLD"].includes(direction)) {
+    if (activeTrade && ["BUY", "HOLD"].includes(direction) && activeTrade.targetPrice && activeTrade.stopPrice) {
       const movePercent = (currentPrice / activeTrade.entryPrice - 1) * 100;
       if (currentPrice >= activeTrade.targetPrice) {
         telegramMessage = `${symbol} · TARGET REACHED · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry: ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget scenario: ${formatMarketPrice(symbol, activeTrade.targetPrice)}\nConsider reviewing or closing your position. This alert does not place an order.`;
@@ -512,7 +512,7 @@ function App(){
       deliveredSignalStates[symbol] !== signalStatusKey
     ) {
       telegramMessage = direction === "BUY"
-        ? `${symbol} · BUY signal is active · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nTracked signal entry: ${formatMarketPrice(symbol, activeTrade?.entryPrice || currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade?.targetPrice || currentPrice * 1.022)} · Stop: ${formatMarketPrice(symbol, activeTrade?.stopPrice || currentPrice * 0.985)}\nInformational signal only; no order is placed.`
+        ? `${symbol} · BUY rule remains active · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nReference close: ${formatMarketPrice(symbol, signal.reference_price)}\nTarget scenario: ${formatMarketPrice(symbol, signal.target_price)} · Stop scenario: ${formatMarketPrice(symbol, signal.stop_loss)}\nInformational rule output only; no order is placed.`
         : direction === "HOLD"
           ? activeTrade
             ? `${symbol} · HOLD existing BUY · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry: ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade.targetPrice)} · Stop: ${formatMarketPrice(symbol, activeTrade.stopPrice)}\nIndicative move only; it is not actual account P&L.`
@@ -558,6 +558,9 @@ function App(){
   }, [isLoggedIn, symbol, market, signal, telegramConfig.botToken, telegramConfig.chatId]);
 
   async function runBacktest(customForm = backtestForm){
+    setBacktestError("");
+    setBacktest(null);
+    try { localStorage.removeItem("trademind-last-backtest"); } catch {}
     const timeframe = customForm.timeframe || "1d";
     const durationUnit = customForm.durationUnit || "days";
     const maxDuration = maxDurationForUnit(timeframe, durationUnit);
@@ -577,7 +580,10 @@ function App(){
     });
     const r = await fetch(API + "/backtest?" + params.toString(), {method: "POST"});
     const result = await r.json();
-    if (!r.ok) throw new Error(result.detail || "Backtest failed.");
+    if (!r.ok) {
+      setBacktestError(result.detail || "Backtest failed.");
+      throw new Error(result.detail || "Backtest failed.");
+    }
     const merged = {...result, ...form, strategy: form.strategy, equity_curve: result.equity_curve || []};
     setBacktest(merged);
     setPage("Backtesting");
@@ -675,7 +681,7 @@ function App(){
   function addStrategy(name, rule){
     if (!name?.trim() || strategies.some((item) => item.name.toLowerCase() === name.trim().toLowerCase())) return false;
     const source = defaultStrategies.find((item) => item.rule === rule) || defaultStrategies[0];
-    setStrategies((current) => [...current, {name: name.trim(), rule: source.rule, risk: "Medium", status: "READY", description: `Custom name using ${source.name} entry and exit rules.`}]);
+    setStrategies((current) => [...current, {...source, name: name.trim(), risk: "Medium", status: "READY", description: `Custom label using ${source.name} executable rules.`}]);
     return true;
   }
 
@@ -851,7 +857,7 @@ function App(){
           {page === "Dashboard" && <Dashboard markets={markets} symbol={symbol} setSymbol={setSymbol} market={market} signal={signal} chartInterval={chartInterval} setChartInterval={setChartInterval} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} onViewAll={() => setPage("Signals")} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Signals" && <Signals symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} chartInterval={chartInterval} setChartInterval={setChartInterval} strategies={strategies} selectedStrategy={selectedStrategy} setSelectedStrategy={setSelectedStrategy} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Options Trading" && <OptionsTrading symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} addLog={addLog} />}
-          {page === "Backtesting" && <Backtesting backtest={backtest} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} symbol={symbol} backtestForm={backtestForm} setBacktestForm={setBacktestForm} strategies={strategies} notifyTelegram={notifyTelegram} addLog={addLog} />}
+          {page === "Backtesting" && <Backtesting backtest={backtest} backtestError={backtestError} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} symbol={symbol} backtestForm={backtestForm} setBacktestForm={setBacktestForm} strategies={strategies} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Risk Management" && <Risk riskRules={riskRules} setRiskRules={setRiskRules} saveRiskRules={saveRiskRules} addLog={addLog} />}
           {page === "Reports" && <Reports backtest={backtest} exportReport={exportReport} exportMessage={exportMessage} notifyTelegram={notifyTelegram} />}
           {page === "Strategies" && <Strategies strategies={strategies} addStrategy={addStrategy} configureStrategy={configureStrategy} addLog={addLog} />}
@@ -1071,7 +1077,6 @@ function Dashboard({markets, symbol, setSymbol, market, signal, chartInterval, s
     {title: "Nifty 50", value: marketMap["NIFTY 50"] ? `₹${marketMap["NIFTY 50"].price.toLocaleString("en-IN", {maximumFractionDigits: 2})}` : "—", delta: marketMap["NIFTY 50"] ? formatPercent(marketMap["NIFTY 50"].change) : "—", icon: "N"},
     {title: "Bank Nifty", value: marketMap["BANK NIFTY"] ? `₹${marketMap["BANK NIFTY"].price.toLocaleString("en-IN", {maximumFractionDigits: 2})}` : "—", delta: marketMap["BANK NIFTY"] ? formatPercent(marketMap["BANK NIFTY"].change) : "—", icon: "B"}
   ];
-  const signalPlan = getSignalPlan(symbol, market, signal);
   const intervalChoices = [["1m", "1m"], ["2m", "2m"], ["5m", "5m"], ["15m", "15m"], ["30m", "30m"], ["60m", "60m"], ["90m", "90m"], ["1h", "1h"], ["1D", "1d"], ["5D", "5d"], ["1W", "1wk"], ["1M", "1mo"], ["3M", "3mo"]];
   const allChartSeries = market?.series || [];
   const chartRangeOptions = [["1D", 1], ["5D", 5], ["1M", 30], ["3M", 90], ["6M", 180], ["1Y", 365], ["All", null]];
@@ -1276,9 +1281,8 @@ function Dashboard({markets, symbol, setSymbol, market, signal, chartInterval, s
           </div>
         </div>
         <div className="panel signalPanel">
-          <div className="panelHead"><h3>AI Signal</h3><span className="badge">MODEL v1.0</span></div>
-          <div className={"signal " + (signal?.signal || "HOLD").toLowerCase()}>{signal?.signal || "WAIT"}<small>{signal?.confidence || 0}% confidence</small></div>
-          <div className="meter"><span style={{width: `${signal?.confidence || 0}%`}} /></div>
+          <div className="panelHead"><h3>Strategy Signal</h3><span className="badge">RULE-BASED</span></div>
+          <div className={"signal " + (signal?.signal || "HOLD").toLowerCase()}>{signal?.signal || "WAIT"}<small>{signal?.setup_status?.replaceAll("_", " ") || "WAITING FOR DATA"}</small></div>
           <div className="indicatorRows">
             <Row name="RSI" value={signal?.rsi ?? "—"} status={signal?.rsi > 70 ? "Overbought" : "Neutral"} />
             <Row name="MACD" value={signal?.macd ?? "—"} status="Trend" />
@@ -1300,20 +1304,20 @@ function Dashboard({markets, symbol, setSymbol, market, signal, chartInterval, s
               <button className="outline" type="button" aria-label="Close signal details" onClick={() => setShowSignalDetails(false)}>Close</button>
             </div>
             <div className="signalDetailGrid">
-              <Row name="Signal" value={signal?.signal || "WAIT"} status={`${signal?.confidence || 0}% confidence`} />
-              <Row name="Bias" value={signalPlan.bias} status={market?.live ? "Provider data · delay possible" : "Synthetic demo data"} />
+              <Row name="Signal" value={signal?.signal || "WAIT"} status={signal?.setup_status?.replaceAll("_", " ") || "Waiting"} />
+              <Row name="Direction" value={signal?.signal === "BUY" ? "Long setup" : signal?.signal === "SELL" ? "Exit long" : "No trade"} status={market?.live ? "Provider data · delay possible" : "Synthetic demo data"} />
               <Row name="Market price" value={toCurrency(market?.price)} status={market?.updated_at ? new Date(market.updated_at).toLocaleString() : "Awaiting data"} />
-              <Row name="Entry" value={toCurrency(signalPlan.entry)} status="Indicative" />
-              <Row name="Target exit" value={toCurrency(signalPlan.exit)} status="Indicative" />
-              <Row name="Stop loss" value={toCurrency(signalPlan.stopLoss)} status="Indicative" />
+              <Row name="Entry reference" value={toCurrency(signal?.entry_price)} status="Last signal close" />
+              <Row name="Target scenario" value={toCurrency(signal?.target_price)} status={signal?.risk_reward ? `${signal.risk_reward}R` : "Not available"} />
+              <Row name="Stop scenario" value={toCurrency(signal?.stop_loss)} status={signal?.atr_14 ? `ATR 14: ${signal.atr_14}` : "Not available"} />
               <Row name="RSI (14)" value={signal?.rsi ?? "—"} status={signal?.rsi > 70 ? "Overbought" : signal?.rsi < 30 ? "Oversold" : "Neutral"} />
               <Row name="MACD" value={signal?.macd ?? "—"} status="Trend indicator" />
             </div>
-            <p className="signalDisclaimer">Signal levels are indicative estimates for analysis only, not exchange-verified option prices or investment advice.</p>
+            <p className="signalDisclaimer">{signal?.rule_triggered || "No rule triggered on the latest candle."} Levels are calculated from the last close and ATR; they are scenarios, not fills or profit probabilities.</p>
             <div className="signalDialogActions">
               <button className="outline" type="button" onClick={() => setShowSignalDetails(false)}>Done</button>
               <button className="primary" type="button" onClick={() => {
-                const message = `${symbol}: ${signal?.signal || "WAIT"} signal with ${signal?.confidence || 0}% confidence. Entry ${signalPlan.entry}, Exit ${signalPlan.exit}, Stop Loss ${signalPlan.stopLoss}.`;
+                const message = `${symbol}: ${signal?.signal || "WAIT"} · ${signal?.strategy || "Strategy"}. ${signal?.rule_triggered || "No rule triggered."} Reference ${formatMarketPrice(symbol, signal?.reference_price)}, target ${formatMarketPrice(symbol, signal?.target_price)}, stop ${formatMarketPrice(symbol, signal?.stop_loss)}.`;
                 addLog(message, "info");
                 notifyTelegram(message);
               }}>Send details to Telegram</button>
@@ -1333,9 +1337,7 @@ function Dashboard({markets, symbol, setSymbol, market, signal, chartInterval, s
         </div>
         <div className="panel activity">
           <div className="panelHead"><h3>Recent Signals</h3><button className="linkButton" onClick={onViewAll}>View all</button></div>
-          <div className="signalLine"><i className="buy">BUY</i><b>NIFTY 50</b><span>09:42 AM</span><strong>₹25,842</strong></div>
-          <div className="signalLine"><i className="sell">SELL</i><b>BTC/USDT</b><span>09:18 AM</span><strong>$112,640</strong></div>
-          <div className="signalLine"><i className="hold">HOLD</i><b>BANK NIFTY</b><span>08:57 AM</span><strong>₹58,320</strong></div>
+          {signal ? <><div className="signalLine"><i className={(signal.signal || "HOLD").toLowerCase()}>{signal.signal || "WAIT"}</i><b>{symbol}</b><span>{signal.bar_time ? new Date(signal.bar_time).toLocaleString() : "Latest bar"}</span><strong>{formatMarketPrice(symbol, signal.reference_price)}</strong></div><p>{signal.rule_triggered}</p></> : <p>No signal data is available yet.</p>}
         </div>
       </div>
     </>
@@ -1477,34 +1479,35 @@ function OptionSignalNotification({details, expanded = false}){
 }
 
 function Signals({symbol, setSymbol, signal, markets, market, chartInterval, setChartInterval, strategies, selectedStrategy, setSelectedStrategy, notifyTelegram, addLog}){
-  const plan = getSignalPlan(symbol, market, signal);
   return (
     <>
       <div className="pageHead">
-        <div><p className="eyebrow">AI ENGINE</p><h1>Trading Signals</h1><p>Generated from technical indicators and strategy rules.</p></div>
+        <div><p className="eyebrow">RULE ENGINE</p><h1>Trading Signals</h1><p>Completed-candle setups with explicit entry and exit conditions.</p></div>
         <div className="signalToolbar"><select aria-label="Signal symbol" value={symbol} onChange={(event) => setSymbol(event.target.value)}>{(markets || []).map((m) => <option key={m.symbol}>{m.symbol}</option>)}</select><select aria-label="Signal strategy" value={selectedStrategy} onChange={(event) => setSelectedStrategy(event.target.value)}>{strategies.map((item) => <option key={item.name}>{item.name}</option>)}</select><select aria-label="Signal timeframe" value={chartInterval} onChange={(event) => setChartInterval(event.target.value)}><option value="1m">1 minute</option><option value="2m">2 minutes</option><option value="5m">5 minutes</option><option value="15m">15 minutes</option><option value="30m">30 minutes</option><option value="60m">1 hour</option><option value="1d">1 day</option><option value="1wk">1 week</option></select></div>
       </div>
       <div className="signalHero">
         <div>
           <span className="eyebrow">CURRENT SIGNAL</span>
           <div className={"heroSignal " + (signal?.signal || "HOLD").toLowerCase()}>{signal?.signal || "WAIT"}</div>
-          <p>Rule strength: <b>{signal?.confidence || 0}%</b> · not a probability of profit</p>
+          <p>{signal?.setup_status?.replaceAll("_", " ") || "Waiting for market data"} · not a probability of profit</p>
         </div>
         <div className="featureList">
-          <Row name="Signal date" value={formatTradeDate()} status="Trade date" />
+          <Row name="Signal candle" value={signal?.bar_time ? new Date(signal.bar_time).toLocaleString() : "—"} status="Last completed bar" />
           <Row name="RSI (14)" value={signal?.rsi ?? "—"} status="Calculated" />
           <Row name="MACD" value={signal?.macd ?? "—"} status="Calculated" />
           <Row name="Timeframe" value={signal?.timeframe || chartInterval} status="" />
-          <Row name="Entry" value={plan.entry} status={plan.bias} />
-          <Row name="Exit" value={plan.exit} status="Target" />
-          <Row name="Stop Loss" value={plan.stopLoss} status="Risk" />
+          <Row name="Reference close" value={formatMarketPrice(symbol, signal?.reference_price)} status={signal?.bar_time ? new Date(signal.bar_time).toLocaleString() : "No bar"} />
+          <Row name="Entry reference" value={formatMarketPrice(symbol, signal?.entry_price)} status="BUY only" />
+          <Row name="Target scenario" value={formatMarketPrice(symbol, signal?.target_price)} status={signal?.risk_reward ? `${signal.risk_reward}R` : "Unavailable"} />
+          <Row name="Stop scenario" value={formatMarketPrice(symbol, signal?.stop_loss)} status={signal?.atr_14 ? `1.5 ATR · ${signal.atr_14}` : "Unavailable"} />
           <Row name="Strategy" value={signal?.strategy || selectedStrategy} status={signal?.live ? "Yahoo history · delay possible" : "Synthetic demo data"} />
         </div>
       </div>
+      <div className="panel signalLogPanel"><b>Rule trigger</b><p>{signal?.rule_triggered || "Waiting for market data."}</p></div>
       <p className="warningText">{signal?.note || "Signal is a technical rule output, not a validated forecast. Quotes may be delayed; confirm current prices with your broker before acting."}</p>
       <div className="panel signalLogPanel">
         <div className="panelHead"><h3>Signal alert</h3><button className="outline" onClick={() => {
-          const message = `${symbol}: ${signal?.signal || "WAIT"} signal on ${formatTradeDate()}. Entry ${plan.entry}, Exit ${plan.exit}, SL ${plan.stopLoss}.`;
+          const message = `${symbol}: ${signal?.signal || "WAIT"} · ${signal?.strategy || selectedStrategy}. ${signal?.rule_triggered || "No rule triggered."} Reference ${formatMarketPrice(symbol, signal?.reference_price)}, target ${formatMarketPrice(symbol, signal?.target_price)}, stop ${formatMarketPrice(symbol, signal?.stop_loss)}.`;
           addLog(message, "info");
           notifyTelegram(message);
         }}>Send to Telegram</button></div>
@@ -1802,10 +1805,12 @@ function OptionsTrading({symbol, setSymbol, signal, markets, market, addLog}){
   );
 }
 
-function Backtesting({backtest, runBacktest, symbol, backtestForm, setBacktestForm, strategies, notifyTelegram, addLog}){
+function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm, setBacktestForm, strategies, notifyTelegram, addLog}){
   const chartData = useMemo(() => {
-    const labels = (backtest?.equity_curve || []).map((_, index) => `T${index + 1}`);
     const values = backtest?.equity_curve || [];
+    const labels = values.map((_, index) => backtest?.equity_timestamps?.[index]
+      ? new Date(backtest.equity_timestamps[index]).toLocaleDateString()
+      : `Bar ${index + 1}`);
     return {
       labels,
       datasets: [{label: "Equity", data: values, borderColor: "#62d5ff", backgroundColor: "rgba(98,213,255,.15)", fill: true, tension: 0.2, pointRadius: 2, pointHoverRadius: 5, borderWidth: 2, spanGaps: true}]
@@ -1814,7 +1819,7 @@ function Backtesting({backtest, runBacktest, symbol, backtestForm, setBacktestFo
 
   return (
     <>
-      <div className="pageHead"><div><p className="eyebrow">STRATEGY LAB</p><h1>Backtesting</h1><p>Historical rule-based simulation. Results depend on provider history, costs and assumptions.</p></div><button className="primary" onClick={() => { runBacktest(); notifyTelegram(`Backtest started for ${backtestForm.symbol} using ${backtestForm.strategy}.`); }}>Run {symbol} Test</button></div>
+      <div className="pageHead"><div><p className="eyebrow">STRATEGY LAB</p><h1>Backtesting</h1><p>Historical rule-based simulation. Results depend on provider history, costs and assumptions.</p></div><button className="primary" onClick={() => { runBacktest(); notifyTelegram(`Backtest started for ${backtestForm.symbol} using ${backtestForm.strategy}.`); }}>Run {backtestForm.symbol} Test</button></div>
       <div className="panel backtestFormPanel">
         <div className="formGrid">
           <label>Market symbol<select value={backtestForm.symbol} onChange={(event) => setBacktestForm((current) => ({...current, symbol: event.target.value}))}><option>NIFTY 50</option><option>BANK NIFTY</option><option>SENSEX</option><option>RELIANCE</option><option>TCS</option><option>INFOSYS</option><option>HDFC BANK</option><option>ICICI BANK</option><option>SBIN</option><option>ITC</option><option>BHARTI AIRTEL</option><option>BTC/USDT</option><option>ETH/USDT</option></select></label>
@@ -1830,10 +1835,11 @@ function Backtesting({backtest, runBacktest, symbol, backtestForm, setBacktestFo
           <label>Duration<div className="durationInputGroup"><input aria-label="Duration amount" type="number" min="1" max={maxDurationForUnit(backtestForm.timeframe, backtestForm.durationUnit)} step="1" required value={backtestForm.durationValue} onChange={(event) => setBacktestForm((current) => ({...current, durationValue: event.target.value}))} /><select aria-label="Duration unit" value={backtestForm.durationUnit} onChange={(event) => setBacktestForm((current) => ({...current, durationUnit: event.target.value, durationValue: "1"}))}><option value="days">Days</option><option value="months" disabled={!maxDurationForUnit(backtestForm.timeframe, "months")}>Months</option><option value="years" disabled={!maxDurationForUnit(backtestForm.timeframe, "years")}>Years</option></select></div></label>
           <label>Initial capital<input type="number" value={backtestForm.initialCapital} onChange={(event) => setBacktestForm((current) => ({...current, initialCapital: event.target.value}))} /></label>
           <label>Position budget (₹)<input type="number" min="1" value={backtestForm.positionSize} onChange={(event) => setBacktestForm((current) => ({...current, positionSize: event.target.value}))} /></label>
-          <label>Stop loss %<input type="number" min="0" step="0.1" value={backtestForm.stopLoss} onChange={(event) => setBacktestForm((current) => ({...current, stopLoss: event.target.value}))} /></label>
+          <label>Protective stop loss (%)<input type="number" min="0" step="0.1" value={backtestForm.stopLoss} onChange={(event) => setBacktestForm((current) => ({...current, stopLoss: event.target.value}))} /></label>
           <label>Estimated fee per side (bps)<input type="number" min="0" max="1000" step="1" value={backtestForm.feeBps || "10"} onChange={(event) => setBacktestForm((current) => ({...current, feeBps: event.target.value}))} /></label>
         </div>
       </div>
+      {backtestError && <p className="warningText" role="alert">{backtestError}</p>}
       {backtest ? (
         <>
           <div className="grid4">
@@ -1901,9 +1907,10 @@ function Strategies({strategies, addStrategy, configureStrategy, addLog}){
   const [showNew, setShowNew] = useState(false);
   const [newName, setNewName] = useState("");
   const [newError, setNewError] = useState("");
-  const [newRule, setNewRule] = useState("momentum");
+  const [newRule, setNewRule] = useState("price_action_retest");
   const [editing, setEditing] = useState(null);
   const [editRisk, setEditRisk] = useState("Medium");
+  const selectedTemplate = defaultStrategies.find((strategy) => strategy.rule === newRule) || defaultStrategies[0];
 
   function submitNewStrategy(event){
     event.preventDefault();
@@ -1928,8 +1935,8 @@ function Strategies({strategies, addStrategy, configureStrategy, addLog}){
   return (
     <>
       <div className="pageHead"><div><p className="eyebrow">CONFIGURATION</p><h1>Trading Strategies</h1><p>Create and manage rule-based strategies.</p></div><button className="primary" onClick={() => { setShowNew(true); setNewError(""); }}>+ New Strategy</button></div>
-      {showNew && <form className="panel" onSubmit={submitNewStrategy}><label>Strategy name<input autoFocus maxLength="40" value={newName} onChange={(event) => { setNewName(event.target.value); setNewError(""); }} required /></label><label>Executable entry and exit rules<select value={newRule} onChange={(event) => setNewRule(event.target.value)}>{defaultStrategies.map((strategy) => <option key={strategy.rule} value={strategy.rule}>{strategy.name}</option>)}</select></label><p>New strategies use one of the five implemented rule sets and can be backtested immediately.</p>{newError && <span role="alert">{newError}</span>}<button className="primary" type="submit">Create Strategy</button><button className="outline" type="button" onClick={() => setShowNew(false)}>Cancel</button></form>}
-      <div className="strategyGrid">{strategies.map((strategy) => <div className="panel strategy" key={strategy.name}><span className={`badge ${strategy.status === "READY" ? "muted" : ""}`}>{strategy.status}</span><h3>{strategy.name}</h3><p>{strategy.description}</p><Row name="Risk" value={strategy.risk} status={strategy.status === "ACTIVE" ? "Configured" : "Ready"} /><button className="outline" onClick={() => editing === strategy.name ? setEditing(null) : openConfiguration(strategy)}>{editing === strategy.name ? "Close configuration" : "Configure"}</button>{editing === strategy.name && <form onSubmit={(event) => saveConfiguration(event, strategy.name)}><label>Risk level<select value={editRisk} onChange={(event) => setEditRisk(event.target.value)}><option>Low</option><option>Medium</option><option>High</option></select></label><button className="primary" type="submit">Save configuration</button></form>}</div>)}</div>
+      {showNew && <form className="panel" onSubmit={submitNewStrategy}><label>Strategy name<input autoFocus maxLength="40" value={newName} onChange={(event) => { setNewName(event.target.value); setNewError(""); }} required /></label><label>Executable rule template<select value={newRule} onChange={(event) => setNewRule(event.target.value)}>{defaultStrategies.map((strategy) => <option key={strategy.rule} value={strategy.rule}>{strategy.name}</option>)}</select></label><p>{selectedTemplate.description}</p><p><b>Entry:</b> {selectedTemplate.entryRules.join(" ")}</p><p><b>Exit:</b> {selectedTemplate.exitRules.join(" ")}</p><p>A custom name selects this rule template; it does not create new trading logic.</p>{newError && <span role="alert">{newError}</span>}<button className="primary" type="submit">Create Strategy</button><button className="outline" type="button" onClick={() => setShowNew(false)}>Cancel</button></form>}
+      <div className="strategyGrid">{strategies.map((strategy) => <div className="panel strategy" key={strategy.name}><span className={`badge ${strategy.status === "READY" ? "muted" : ""}`}>{strategy.status}</span><h3>{strategy.name}</h3><p>{strategy.description}</p><p><b>Entry:</b> {(strategy.entryRules || []).join(" ") || "Rule details unavailable for this saved custom strategy."}</p><p><b>Exit:</b> {(strategy.exitRules || []).join(" ") || "Rule details unavailable for this saved custom strategy."}</p><Row name="Risk" value={strategy.risk} status="User setting only" /><button className="outline" onClick={() => editing === strategy.name ? setEditing(null) : openConfiguration(strategy)}>{editing === strategy.name ? "Close configuration" : "Configure"}</button>{editing === strategy.name && <form onSubmit={(event) => saveConfiguration(event, strategy.name)}><label>Risk level<select value={editRisk} onChange={(event) => setEditRisk(event.target.value)}><option>Low</option><option>Medium</option><option>High</option></select></label><button className="primary" type="submit">Save configuration</button></form>}</div>)}</div>
     </>
   );
 }

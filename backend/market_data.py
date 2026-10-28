@@ -147,7 +147,8 @@ def market_frame(symbol="NIFTY 50", periods=80, live=True, interval="5m", durati
     key = (symbol, periods, interval, duration, duration_unit)
     now = time.time()
     if live and key in _cache and now - _cache[key][0] < CACHE_SECONDS:
-        return _cache[key][1].copy(), True
+        cached_at, cached_df, cached_is_live = _cache[key]
+        return cached_df.copy(), cached_is_live
 
     df = None
     if live and yf is not None and symbol in SYMBOL_MAP:
@@ -180,5 +181,5 @@ def market_frame(symbol="NIFTY 50", periods=80, live=True, interval="5m", durati
         df = _demo_frame(symbol, periods, interval, duration, duration_unit)
 
     df = _add_indicators(df)
-    _cache[key] = (now, df.copy())
+    _cache[key] = (now, df.copy(), is_live)
     return df, is_live

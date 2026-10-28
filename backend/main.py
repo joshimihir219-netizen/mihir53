@@ -359,6 +359,25 @@ def signal(
     if strategy not in STRATEGIES and strategy not in STRATEGIES.values():
         raise HTTPException(status_code=422, detail=f"Unsupported strategy. Choose one of: {', '.join(STRATEGIES)}.")
     df, live = market_frame(symbol, 200, live=True, interval=interval)
+    if not live:
+        return {
+            "symbol": symbol,
+            "timeframe": interval,
+            "live": False,
+            "data_source": "Synthetic demo data",
+            "signal": "HOLD",
+            "setup_status": "NO_LIVE_DATA",
+            "reference_price": None,
+            "entry_price": None,
+            "stop_loss": None,
+            "target_price": None,
+            "risk_reward": None,
+            "atr_14": None,
+            "strategy": strategy,
+            "rule": STRATEGIES.get(strategy, strategy),
+            "rule_triggered": "No signal generated because live historical data is unavailable.",
+            "note": "Synthetic demo candles are for chart display only and are never used to generate signals.",
+        }
     result = generate_signal(df, strategy)
     return {"symbol": symbol, "timeframe": interval, "live": live, "data_source": "Yahoo Finance chart history" if live else "Synthetic demo data", **result}
 
@@ -378,7 +397,7 @@ def backtest(
     timeframe: str = Query("15m", pattern="^(1m|2m|5m|15m|30m|60m|90m|1h|1d|5d|1wk|1mo|3mo)$"),
     duration: int = Query(5, ge=1, le=3650),
     duration_unit: str = Query("days", pattern="^(days|months|years)$"),
-    strategy: str = Query("Opening Range Breakout"),
+    strategy: str = Query("Price Action Break & Retest"),
     position_size: float = Query(1000, gt=0),
     stop_loss_pct: float = Query(1.5, ge=0, le=100),
     fee_bps: float = Query(10, ge=0, le=1000),
@@ -391,23 +410,29 @@ def backtest(
             status_code=422,
             detail=f"Duration cannot exceed {max_duration} {duration_unit} for {timeframe} timeframe.",
         )
-    df, live = market_frame(symbol, 6000, live=True, interval=timeframe, duration=duration, duration_unit=duration_unit)
+    df, live = market_frame(symbol, 6000, live=True, interval=timeframe)
+    if not live:
+        raise HTTPException(
+            status_code=503,
+            detail="Live historical data is unavailable. Synthetic demo candles are not used for backtests.",
+        )
     cutoff = pd.Timestamp.now(tz="UTC") - _duration_offset(duration, duration_unit)
     timestamps = pd.to_datetime(df["time"], utc=True)
-    df = df.loc[timestamps >= cutoff].reset_index(drop=True)
-    if df.empty:
+    in_period = timestamps >= cutoff
+    if not in_period.any():
         raise HTTPException(status_code=502, detail="No market data is available for the selected backtest period.")
+    start_index = int(in_period.to_numpy().argmax())
     return {
-        **run_backtest(df, initial_capital, strategy, position_size, stop_loss_pct, fee_bps),
+        **run_backtest(df, initial_capital, strategy, position_size, stop_loss_pct, fee_bps, start_index),
         "timeframe": timeframe,
         "duration": duration,
         "duration_unit": duration_unit,
         "history_period": TIMEFRAME_HISTORY[timeframe],
-        "data_source": "Yahoo Finance chart history (delay possible)" if live else "Synthetic demo data",
-        "bar_count": len(df),
-        "period_start": pd.Timestamp(df.time.iloc[0]).isoformat(),
+        "data_source": "Yahoo Finance chart history (delay possible)",
+        "bar_count": len(df) - start_index,
+        "period_start": pd.Timestamp(df.time.iloc[start_index]).isoformat(),
         "period_end": pd.Timestamp(df.time.iloc[-1]).isoformat(),
-        "warning": "Yahoo Finance history may be delayed; this is not exchange-authoritative real-time data." if live else "This result used synthetic demo candles because live historical data was unavailable. Do not treat it as a real market backtest.",
+        "warning": "Yahoo Finance history may be delayed and may be adjusted; this is not exchange-authoritative data. Model excludes taxes, brokerage schedules, lot-size constraints, and market impact.",
     }
 
 @app.get("/api/risk")
