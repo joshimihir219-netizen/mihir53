@@ -4,7 +4,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from backtest import STRATEGIES, STRATEGY_DETAILS, run_backtest, strategy_mask
+from backtest import STRATEGIES, STRATEGY_DETAILS, custom_strategy_mask, run_backtest, strategy_mask
 import market_data
 from ml_engine import generate_signal
 
@@ -80,6 +80,27 @@ class BacktestExecutionTests(unittest.TestCase):
         self.assertEqual(stop["reason"], "stop_loss")
         self.assertEqual(stop["price"], 8.5)
 
+    def test_target_executes_at_configured_r_multiple(self):
+        frame = candles([10, 10, 10, 10], [11, 12, 12, 12], [9, 10, 10, 10], [10, 11, 11, 11])
+        entries = np.array([False, True, False, False])
+        exits = np.zeros(4, dtype=bool)
+
+        with patch("backtest.strategy_mask", return_value=(entries, exits)):
+            result = run_backtest(frame, 10000, "test", 1000, 10, 0, take_profit_rr=2)
+
+        self.assertEqual(result["trade_log"][1]["reason"], "take_profit")
+        self.assertEqual(result["trade_log"][1]["price"], 12)
+
+    def test_stop_precedes_target_when_both_are_touched(self):
+        frame = candles([10, 10, 10, 10], [11, 12, 13, 12], [9, 10, 7, 10], [10, 11, 11, 11])
+        entries = np.array([False, True, False, False])
+        exits = np.zeros(4, dtype=bool)
+
+        with patch("backtest.strategy_mask", return_value=(entries, exits)):
+            result = run_backtest(frame, 10000, "test", 1000, 10, 0, take_profit_rr=2)
+
+        self.assertEqual(result["trade_log"][1]["reason"], "stop_loss")
+
     def test_preperiod_signal_can_fill_first_test_bar_without_scoring_warmup(self):
         frame = candles([10, 10, 20, 21], [11, 12, 22, 22], [9, 10, 19, 20], [10, 11, 21, 21])
         entries = np.array([False, True, False, False])
@@ -126,6 +147,65 @@ class StrategyRuleTests(unittest.TestCase):
             prefix = strategy_mask(frame.iloc[:split], rule)
             np.testing.assert_array_equal(full[0][:split], prefix[0])
             np.testing.assert_array_equal(full[1][:split], prefix[1])
+
+    def test_builtin_strategies_have_distinct_masks_on_identical_history(self):
+        rng = np.random.default_rng(42)
+        close = 100 * np.cumprod(1 + rng.normal(0.001, 0.02, 1200))
+        spread = rng.uniform(0.001, 0.012, len(close))
+        open_price = close * (1 + rng.normal(0, 0.008, len(close)))
+        frame = pd.DataFrame({
+            "time": pd.date_range("2025-01-01", periods=len(close), freq="h"),
+            "open": open_price,
+            "high": np.maximum(open_price, close) * (1 + spread),
+            "low": np.minimum(open_price, close) * (1 - spread),
+            "close": close,
+            "volume": rng.integers(100, 10000, len(close)),
+        })
+        masks = [strategy_mask(frame, rule) for rule in STRATEGIES.values()]
+        unique_masks = {(tuple(entries), tuple(exits)) for entries, exits in masks}
+        self.assertGreaterEqual(len(unique_masks), len(STRATEGIES) - 1)
+        self.assertGreaterEqual(sum(int(entries.sum()) > 0 for entries, _ in masks), 15)
+
+    def test_custom_rule_evaluates_indicator_comparison_and_nested_logic(self):
+        frame = candles([8, 9, 11, 12], [9, 10, 12, 13], [7, 8, 10, 11], [8, 9, 11, 12])
+        definition = {
+            "entry": {
+                "logic": "AND",
+                "conditions": [
+                    {"left": {"indicator": "CLOSE"}, "operator": "crosses_above", "right": 10},
+                    {"logic": "OR", "conditions": [
+                        {"left": {"indicator": "CLOSE"}, "operator": "gt", "right": 10},
+                    ]},
+                ],
+            },
+            "exit": {"logic": "OR", "conditions": [
+                {"left": {"indicator": "CLOSE"}, "operator": "lt", "right": 8},
+            ]},
+        }
+        entries, exits = custom_strategy_mask(frame, definition)
+        np.testing.assert_array_equal(entries, [False, False, True, False])
+        np.testing.assert_array_equal(exits, [False, False, False, False])
+
+    def test_custom_indicator_rules_do_not_use_future_candles(self):
+        frame = candles([10, 11, 12, 9, 8], [11, 12, 13, 10, 9], [9, 10, 11, 8, 7], [10, 11, 12, 9, 8])
+        definition = {
+            "entry": {"logic": "AND", "conditions": [
+                {"left": {"indicator": "CLOSE"}, "operator": "gt", "right": {"indicator": "SMA", "period": 2}},
+            ]},
+            "exit": {"logic": "AND", "conditions": [
+                {"left": {"indicator": "CLOSE"}, "operator": "lt", "right": 9},
+            ]},
+        }
+        full = custom_strategy_mask(frame, definition)
+        prefix = custom_strategy_mask(frame.iloc[:4], definition)
+        np.testing.assert_array_equal(full[0][:4], prefix[0])
+        np.testing.assert_array_equal(full[1][:4], prefix[1])
+
+    def test_custom_rule_rejects_unbounded_or_unknown_logic(self):
+        frame = candles([1], [1], [1], [1])
+        definition = {"entry": {"logic": "EXEC", "conditions": [{}]}, "exit": {"logic": "AND", "conditions": [{}]}}
+        with self.assertRaisesRegex(ValueError, "condition group"):
+            custom_strategy_mask(frame, definition)
 
 
 class MarketDataAndSignalTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 import React, {useEffect, useMemo, useRef, useState} from "react";
 import "./signal-details.css";
+import "./strategy-lab.css";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
 import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingUp, TrendingDown, LogIn} from "lucide-react";
@@ -26,6 +27,19 @@ const defaultStrategies = [
   {name: "ICT Liquidity Sweep", rule: "ict_liquidity_sweep", risk: "High", status: "READY", description: "Sweep below the prior 20-bar low, then bullish displacement through the 5-bar high with a three-candle fair-value gap. Exit below support or EMA 20.", entryRules: ["Sweep below the prior 20-bar low and close back above it.", "Within the next 4 bars, bullish displacement closes above the prior 5-bar high and forms a three-candle fair-value gap."], exitRules: ["Close below the prior 10-bar low.", "Or close below EMA 20."]},
   {name: "EMA Trend Pullback", rule: "ema_trend_pullback", risk: "Medium", status: "READY", description: "EMA 20 above EMA 50; a recent EMA 20 pullback closes bullish back above the average. Exit below EMA 20 or on trend loss.", entryRules: ["EMA 20 and price are above EMA 50.", "A low in the prior 3 bars touched EMA 20; current candle closes bullish above EMA 20."], exitRules: ["Close below EMA 20.", "Or EMA 20 falls below EMA 50."]},
   {name: "Donchian Trend Breakout", rule: "donchian_breakout", risk: "High", status: "READY", description: "A close crosses the prior 20-bar high while EMA 20 is above EMA 50. Exit below prior 10-bar support or on trend loss.", entryRules: ["Close crosses above the highest high of the prior 20 completed bars.", "EMA 20 is above EMA 50."], exitRules: ["Close below the prior 10-bar low.", "Or EMA 20 falls below EMA 50."]}
+  ,{name: "VWAP Reversal", rule: "vwap_reversal", risk: "Medium", status: "READY", description: "Reversal after a close falls below session VWAP by one 20-bar standard deviation and then prints a bullish recovery candle.", entryRules: ["Close is below session VWAP minus 20-bar deviation.", "Bullish candle closes above prior close."], exitRules: ["Close returns to or above session VWAP."]}
+  ,{name: "RSI Mean Reversion", rule: "rsi_mean_reversion", risk: "High", status: "READY", description: "RSI(14) recovers from oversold territory; exit on momentum normalization or return to its 20-bar mean.", entryRules: ["RSI(14) is below 30 and rising.", "Current candle is bullish."], exitRules: ["RSI exceeds 60 or price closes above its 20-bar mean."]}
+  ,{name: "MACD Momentum", rule: "macd_momentum", risk: "Medium", status: "READY", description: "Bullish MACD signal-line crossover above zero; exit on the reverse crossover.", entryRules: ["MACD(12,26) crosses above its 9-period signal.", "MACD is positive."], exitRules: ["MACD crosses below its signal line."]}
+  ,{name: "ADX Trend Following", rule: "adx_trend_following", risk: "Medium", status: "READY", description: "Directional movement confirms a strong trend above EMA 20; exit on DI reversal or weakening ADX.", entryRules: ["ADX(14) exceeds 25 and +DI crosses above -DI.", "Close is above EMA 20."], exitRules: ["-DI exceeds +DI or ADX falls below 18."]}
+  ,{name: "Bollinger Band Breakout", rule: "bollinger_breakout", risk: "High", status: "READY", description: "Close breaks above the 20-period upper band; exit on a return below the middle band or support.", entryRules: ["Close crosses above SMA(20) + 2 standard deviations."], exitRules: ["Close is below SMA(20) or prior 10-bar support."]}
+  ,{name: "Previous Day High/Low Breakout", rule: "previous_day_breakout", risk: "High", status: "READY", description: "Intraday close breaks the previous observed session high; invalidation is previous session low or EMA 20.", entryRules: ["Close crosses above previous session high."], exitRules: ["Close is below previous session low or EMA 20."]}
+  ,{name: "Volume-Based Breakout", rule: "volume_breakout", risk: "High", status: "READY", description: "Prior 20-bar resistance breakout requires volume above 1.5 times the preceding 20-bar average.", entryRules: ["Close crosses prior 20-bar high.", "Volume exceeds 1.5× prior 20-bar average."], exitRules: ["Close breaks prior 10-bar support or relative volume falls below 0.5× average."]}
+  ,{name: "Opening Range Breakout", rule: "opening_range_breakout", risk: "High", status: "READY", description: "After the first 30 minutes of each observed session, enter on an opening-range high break.", entryRules: ["Close crosses above the session's first 30-minute high after that range completes."], exitRules: ["Close falls below the opening-range low or EMA 20."]}
+  ,{name: "Support and Resistance Reversal", rule: "support_resistance_reversal", risk: "Medium", status: "READY", description: "Bullish rejection within 0.2% of prior 20-bar support; exit on support invalidation or EMA 20 loss.", entryRules: ["Low tests prior 20-bar support within 0.2%.", "Candle closes bullish back above support."], exitRules: ["Close falls below support or EMA 20."]}
+  ,{name: "Fair Value Gap Retracement", rule: "fvg_retracement", risk: "High", status: "READY", description: "A three-candle bullish gap sets a zone; enter on a bullish mitigation close within ten bars.", entryRules: ["Current low exceeds the high from two candles earlier.", "Within ten bars price retests the gap and closes bullish above its midpoint."], exitRules: ["Setup expires after ten bars or closes below the gap low.", "Position exits below 10-bar support or EMA 20."]}
+  ,{name: "Order Block Mitigation", rule: "order_block_mitigation", risk: "High", status: "READY", description: "A bullish displacement break creates a zone from the last bearish candle; enter on a later bullish mitigation.", entryRules: ["Bullish displacement exceeds 0.8 ATR and closes above prior 10-bar structure.", "Within ten bars, retest the last bearish candle zone and close above its midpoint."], exitRules: ["Setup expires after ten bars or invalidates below the block low.", "Position exits below 10-bar support or EMA 20."]}
+  ,{name: "Supertrend Trend Following", rule: "supertrend_following", risk: "Medium", status: "READY", description: "Long when the 3×ATR(14) trailing Supertrend state flips bullish; exit on bearish flip.", entryRules: ["Close crosses above the prior final upper Supertrend band."], exitRules: ["Supertrend state flips bearish."]}
+  ,{name: "ATR Volatility Breakout", rule: "atr_volatility_breakout", risk: "High", status: "READY", description: "Prior 20-bar high breakout with ATR(14) above its trailing 50-bar median volatility ratio.", entryRules: ["Close breaks prior 20-bar high plus 0.1 ATR.", "ATR/price is above its trailing 50-bar median."], exitRules: ["Close below prior 10-bar support or EMA 20."]}
 ];
 
 function toCurrency(value){
@@ -102,6 +116,15 @@ function formatSignalMove(entryPrice, currentPrice){
   return `${points >= 0 ? "+" : ""}${points.toFixed(2)} (${percent >= 0 ? "+" : ""}${percent.toFixed(2)}%)`;
 }
 
+function authHeaders(includeJson = true){
+  const headers = includeJson ? {"Content-Type": "application/json"} : {};
+  try {
+    const token = JSON.parse(localStorage.getItem("trademind-auth-session") || "null")?.accessToken;
+    if (token) headers.Authorization = `Bearer ${token}`;
+  } catch {}
+  return headers;
+}
+
 function App(){
   const [page, setPage] = useState("Dashboard");
   const [symbol, setSymbol] = useState("NIFTY 50");
@@ -112,6 +135,7 @@ function App(){
   const [market, setMarket] = useState(null);
   const [signal, setSignal] = useState(null);
   const [backtest, setBacktest] = useState(() => { try { return JSON.parse(localStorage.getItem("trademind-last-backtest") || "null"); } catch { return null; } });
+  const [savedBacktests, setSavedBacktests] = useState([]);
   const [backtestError, setBacktestError] = useState("");
   const [backtestForm, setBacktestForm] = useState({
     symbol: "NIFTY 50",
@@ -122,6 +146,7 @@ function App(){
     initialCapital: "100000",
     positionSize: "1000",
     stopLoss: "1.5",
+    takeProfitRR: "2",
     feeBps: "10"
   });
   const [searchQuery, setSearchQuery] = useState("");
@@ -182,22 +207,12 @@ function App(){
     } catch { return [{time: new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}), message: "System ready", type: "info"}]; }
   });
   const [riskRules, setRiskRules] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem("trademind-risk-rules") || "null");
-      return saved || {stopLoss: "2.0", maxDrawdown: "8.0", dailyLoss: "5000", capitalBox: "250000"};
-    } catch {
-      return {stopLoss: "2.0", maxDrawdown: "8.0", dailyLoss: "5000", capitalBox: "250000"};
-    }
+    return {stopLoss: "2.0", maxDrawdown: "8.0", dailyLoss: "5000", capitalBox: "250000", riskPerTrade: "1", minimumRiskReward: "2", maxTradesPerDay: "5"};
   });
   const [strategies, setStrategies] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem("trademind-strategies") || "[]");
-      const custom = Array.isArray(saved) ? saved.filter((item) => !defaultStrategies.some((preset) => preset.name === item.name) && defaultStrategies.some((preset) => preset.rule === item.rule)) : [];
-      return [...defaultStrategies, ...custom];
-    } catch { return defaultStrategies; }
+    return defaultStrategies;
   });
   const [selectedStrategy, setSelectedStrategy] = useState("EMA Trend Pullback");
-  useEffect(() => { try { localStorage.setItem("trademind-strategies", JSON.stringify(strategies)); } catch {} }, [strategies]);
   useEffect(() => { try { if (backtest) localStorage.setItem("trademind-last-backtest", JSON.stringify(backtest)); } catch {} }, [backtest]);
   const lastSignalTelegramKeyRef = useRef("");
   const pendingSignalTelegramKeyRef = useRef("");
@@ -364,25 +379,56 @@ function App(){
   }, []);
 
   useEffect(() => {
+    if (!isLoggedIn) {
+      setStrategies(defaultStrategies);
+      setSavedBacktests([]);
+      return;
+    }
+    let cancelled = false;
+    Promise.all([
+      fetch(API + "/strategies", {headers: authHeaders(false)}).then(async (response) => {
+        if (!response.ok) throw new Error("Could not load saved strategies.");
+        return response.json();
+      }),
+      fetch(API + "/risk/settings", {headers: authHeaders(false)}).then(async (response) => {
+        if (!response.ok) throw new Error("Could not load saved risk settings.");
+        return response.json();
+      }),
+      fetch(API + "/backtests", {headers: authHeaders(false)}).then(async (response) => {
+        if (!response.ok) throw new Error("Could not load saved backtests.");
+        return response.json();
+      })
+    ]).then(([savedStrategies, savedRiskRules, userBacktests]) => {
+      if (cancelled) return;
+      setStrategies([...defaultStrategies, ...savedStrategies]);
+      setRiskRules({stopLoss: "2.0", maxDrawdown: "8.0", dailyLoss: "5000", capitalBox: "250000", riskPerTrade: "1", minimumRiskReward: "2", maxTradesPerDay: "5", ...savedRiskRules});
+      setSavedBacktests(userBacktests);
+    }).catch((error) => addLog(error.message, "warning"));
+    return () => { cancelled = true; };
+  }, [isLoggedIn]);
+
+  useEffect(() => {
+    const selected = strategies.find((item) => item.name === selectedStrategy);
+    const signalParams = new URLSearchParams({strategy: selected?.rule || selectedStrategy, interval: chartInterval});
+    if (selected?.rule === "custom") signalParams.set("strategy_id", String(selected.id));
     Promise.all([
       fetch(API + "/market/" + encodeURIComponent(symbol) + "?interval=" + chartInterval).then((r) => r.json()),
-      fetch(API + "/signal/" + encodeURIComponent(symbol) + "?strategy=" + encodeURIComponent(selectedStrategy) + "&interval=" + encodeURIComponent(chartInterval)).then((r) => r.json())
+      fetch(API + "/signal/" + encodeURIComponent(symbol) + "?" + signalParams.toString(), {headers: authHeaders(false)}).then((r) => r.json())
     ])
       .then(([m, s]) => { setMarket(m); setSignal(s); })
       .catch(() => {});
-  }, [symbol, chartInterval, selectedStrategy]);
+  }, [symbol, chartInterval, selectedStrategy, strategies]);
 
   useEffect(() => {
     const timer = setInterval(() => {
+      const selected = strategies.find((item) => item.name === selectedStrategy);
+      const signalParams = new URLSearchParams({strategy: selected?.rule || selectedStrategy, interval: chartInterval});
+      if (selected?.rule === "custom") signalParams.set("strategy_id", String(selected.id));
       fetch(API + "/market/" + encodeURIComponent(symbol) + "?interval=" + chartInterval).then((r) => r.json()).then(setMarket).catch(() => {});
-      fetch(API + "/signal/" + encodeURIComponent(symbol) + "?strategy=" + encodeURIComponent(selectedStrategy) + "&interval=" + encodeURIComponent(chartInterval)).then((r) => r.json()).then(setSignal).catch(() => {});
+      fetch(API + "/signal/" + encodeURIComponent(symbol) + "?" + signalParams.toString(), {headers: authHeaders(false)}).then((r) => r.json()).then(setSignal).catch(() => {});
     }, 15000);
     return () => clearInterval(timer);
-  }, [symbol, chartInterval, selectedStrategy]);
-
-  useEffect(() => {
-    try { localStorage.setItem("trademind-risk-rules", JSON.stringify(riskRules)); } catch {}
-  }, [riskRules]);
+  }, [symbol, chartInterval, selectedStrategy, strategies]);
 
   useEffect(() => {
     if (!isLoggedIn || !market?.live || !signal?.live) return;
@@ -578,7 +624,10 @@ function App(){
       stop_loss_pct: String(form.stopLoss || 0),
       fee_bps: String(form.feeBps || 10)
     });
-    const r = await fetch(API + "/backtest?" + params.toString(), {method: "POST"});
+    const takeProfitRR = Number(form.takeProfitRR || configuredStrategy?.risk_settings?.target_r);
+    if (Number.isFinite(takeProfitRR) && takeProfitRR > 0) params.set("take_profit_rr", String(takeProfitRR));
+    if (configuredStrategy?.rule === "custom") params.set("strategy_id", String(configuredStrategy.id));
+    const r = await fetch(API + "/backtest?" + params.toString(), {method: "POST", headers: authHeaders(false)});
     const result = await r.json();
     if (!r.ok) {
       setBacktestError(result.detail || "Backtest failed.");
@@ -586,6 +635,9 @@ function App(){
     }
     const merged = {...result, ...form, strategy: form.strategy, equity_curve: result.equity_curve || []};
     setBacktest(merged);
+    if (result.saved_backtest_id) {
+      setSavedBacktests((current) => [{id: result.saved_backtest_id, strategy_name: form.strategy, strategy_version: configuredStrategy?.version || 0, result: merged, created_at: new Date().toISOString()}, ...current].slice(0, 100));
+    }
     setPage("Backtesting");
     addLog(`Backtest executed for ${form.symbol} using ${form.strategy} strategy on ${timeframe} timeframe over ${duration} ${durationUnit}.`, "info");
   }
@@ -649,6 +701,9 @@ function App(){
       localStorage.removeItem("trademind-auth-session");
     } catch {}
     setIsLoggedIn(false);
+    setStrategies(defaultStrategies);
+    setSavedBacktests([]);
+    setRiskRules({stopLoss: "2.0", maxDrawdown: "8.0", dailyLoss: "5000", capitalBox: "250000", riskPerTrade: "1", minimumRiskReward: "2", maxTradesPerDay: "5"});
     setPage("Dashboard");
     addLog("Logged out from TradeMind.", "warning");
   }
@@ -672,24 +727,45 @@ function App(){
     setSearchQuery("");
   }
 
-  function saveRiskRules(event){
+  async function saveRiskRules(event){
     event.preventDefault();
-    localStorage.setItem("trademind-risk-rules", JSON.stringify(riskRules));
-    addLog("Risk rules saved.", "success");
-  }
-
-  function addStrategy(name, rule){
-    if (!name?.trim() || strategies.some((item) => item.name.toLowerCase() === name.trim().toLowerCase())) return false;
-    const source = defaultStrategies.find((item) => item.rule === rule) || defaultStrategies[0];
-    setStrategies((current) => [...current, {...source, name: name.trim(), risk: "Medium", status: "READY", description: `Custom label using ${source.name} executable rules.`}]);
+    if (!isLoggedIn) throw new Error("Sign in to save user-specific risk rules.");
+    const response = await fetch(API + "/risk/settings", {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify({settings: riskRules})
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "Risk settings could not be saved.");
     return true;
   }
 
-  function configureStrategy(name, risk){
-    const normalizedRisk = risk.trim().toLowerCase();
-    if (!["low", "medium", "high"].includes(normalizedRisk)) return false;
-    setStrategies((current) => current.map((item) => item.name === name ? {...item, risk: normalizedRisk[0].toUpperCase() + normalizedRisk.slice(1)} : item));
-    return true;
+  async function saveStrategy(strategy){
+    if (!isLoggedIn) throw new Error("Sign in to save private strategies.");
+    const isEditing = Number.isInteger(strategy.id);
+    const response = await fetch(API + (isEditing ? `/strategies/${strategy.id}` : "/strategies"), {
+      method: isEditing ? "PUT" : "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(strategy)
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "Strategy could not be saved.");
+    setStrategies((current) => {
+      const withoutSaved = current.filter((item) => item.id !== result.id);
+      return [...withoutSaved, result];
+    });
+    return result;
+  }
+
+  async function removeStrategy(strategy){
+    const response = await fetch(API + `/strategies/${strategy.id}`, {method: "DELETE", headers: authHeaders(false)});
+    if (!response.ok) throw new Error("Strategy could not be deleted.");
+    setStrategies((current) => current.filter((item) => item.id !== strategy.id));
+  }
+
+  function startStrategyBacktest(strategy){
+    setBacktestForm((current) => ({...current, strategy: strategy.name, symbol: strategy.symbol || current.symbol, timeframe: strategy.timeframe || current.timeframe, ...(strategy.rule === "custom" ? {stopLoss: String(strategy.risk_settings?.stop_loss_pct || current.stopLoss), takeProfitRR: String(strategy.risk_settings?.target_r || current.takeProfitRR)} : {})}));
+    setPage("Backtesting");
   }
 
   function exportReport(title, scope, period, result = backtest){
@@ -855,12 +931,12 @@ function App(){
         </header>
         <div className="content">
           {page === "Dashboard" && <Dashboard markets={markets} symbol={symbol} setSymbol={setSymbol} market={market} signal={signal} chartInterval={chartInterval} setChartInterval={setChartInterval} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} onViewAll={() => setPage("Signals")} notifyTelegram={notifyTelegram} addLog={addLog} />}
-          {page === "Signals" && <Signals symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} chartInterval={chartInterval} setChartInterval={setChartInterval} strategies={strategies} selectedStrategy={selectedStrategy} setSelectedStrategy={setSelectedStrategy} notifyTelegram={notifyTelegram} addLog={addLog} />}
+          {page === "Signals" && <Signals symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} chartInterval={chartInterval} setChartInterval={setChartInterval} strategies={strategies} selectedStrategy={selectedStrategy} setSelectedStrategy={setSelectedStrategy} riskRules={riskRules} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Options Trading" && <OptionsTrading symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} addLog={addLog} />}
-          {page === "Backtesting" && <Backtesting backtest={backtest} backtestError={backtestError} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} symbol={symbol} backtestForm={backtestForm} setBacktestForm={setBacktestForm} strategies={strategies} notifyTelegram={notifyTelegram} addLog={addLog} />}
-          {page === "Risk Management" && <Risk riskRules={riskRules} setRiskRules={setRiskRules} saveRiskRules={saveRiskRules} addLog={addLog} />}
+          {page === "Backtesting" && <Backtesting backtest={backtest} backtestError={backtestError} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} symbol={symbol} backtestForm={backtestForm} setBacktestForm={setBacktestForm} strategies={strategies} savedBacktests={savedBacktests} onLoadSavedBacktest={(run) => { setBacktest(run.result); setBacktestForm((current) => ({...current, symbol: run.result.symbol || current.symbol, strategy: run.strategy_name, timeframe: run.result.timeframe || current.timeframe, durationValue: String(run.result.duration || current.durationValue), durationUnit: run.result.duration_unit || current.durationUnit, initialCapital: String(run.result.initial_capital || current.initialCapital), positionSize: String(run.result.position_size || current.positionSize), stopLoss: String(run.result.stop_loss_pct || current.stopLoss), takeProfitRR: String(run.result.take_profit_rr || current.takeProfitRR)})); }} notifyTelegram={notifyTelegram} addLog={addLog} />}
+          {page === "Risk Management" && <Risk riskRules={riskRules} setRiskRules={setRiskRules} saveRiskRules={saveRiskRules} addLog={addLog} isLoggedIn={isLoggedIn} />}
           {page === "Reports" && <Reports backtest={backtest} exportReport={exportReport} exportMessage={exportMessage} notifyTelegram={notifyTelegram} />}
-          {page === "Strategies" && <Strategies strategies={strategies} addStrategy={addStrategy} configureStrategy={configureStrategy} addLog={addLog} />}
+          {page === "Strategies" && <Strategies strategies={strategies} saveStrategy={saveStrategy} removeStrategy={removeStrategy} onBacktest={startStrategyBacktest} savedBacktests={savedBacktests} addLog={addLog} isLoggedIn={isLoggedIn} />}
         </div>
       </main>
       {profileOpen && <ProfileDialog profile={profile} telegramConfig={telegramConfig} onSave={saveProfile} onTestTelegram={(settings) => notifyTelegram("TradeMind Telegram connection test successful.", settings)} onClose={() => setProfileOpen(false)} />}
@@ -1478,7 +1554,20 @@ function OptionSignalNotification({details, expanded = false}){
   );
 }
 
-function Signals({symbol, setSymbol, signal, markets, market, chartInterval, setChartInterval, strategies, selectedStrategy, setSelectedStrategy, notifyTelegram, addLog}){
+function Signals({symbol, setSymbol, signal, markets, market, chartInterval, setChartInterval, strategies, selectedStrategy, setSelectedStrategy, riskRules, notifyTelegram, addLog}){
+  const entry = Number(signal?.entry_price);
+  const stop = Number(signal?.stop_loss);
+  const target = Number(signal?.target_price);
+  const completeSignalLevels = [entry, stop, target].every((value) => Number.isFinite(value) && value > 0);
+  const validLongGeometry = completeSignalLevels && stop < entry && target > entry;
+  const perUnitRisk = validLongGeometry ? entry - stop : 0;
+  const positionRiskBudget = Number(riskRules.capitalBox || 0) * Number(riskRules.riskPerTrade || 0) / 100;
+  const estimatedUnits = perUnitRisk > 0 ? Math.floor(positionRiskBudget / perUnitRisk) : 0;
+  const estimatedLoss = estimatedUnits * perUnitRisk;
+  const signalReward = validLongGeometry ? target - entry : 0;
+  const signalRiskReward = perUnitRisk > 0 ? signalReward / perUnitRisk : null;
+  const riskViolation = signal?.signal === "BUY" && (!validLongGeometry || !estimatedUnits || signalRiskReward < Number(riskRules.minimumRiskReward || 2));
+  const assessmentStatus = signal?.signal !== "BUY" ? "NOT ASSESSED" : riskViolation ? "HIGH RISK · NOT APPROVED" : "WARNING · LEDGER CHECK UNAVAILABLE";
   return (
     <>
       <div className="pageHead">
@@ -1504,6 +1593,13 @@ function Signals({symbol, setSymbol, signal, markets, market, chartInterval, set
         </div>
       </div>
       <div className="panel signalLogPanel"><b>Rule trigger</b><p>{signal?.rule_triggered || "Waiting for market data."}</p></div>
+      <section className="panel signalRiskAssessment">
+        <div className="panelHead"><h3>Risk Assessment</h3><span className={riskViolation ? "riskPill danger" : signal?.signal === "BUY" ? "riskPill warning" : "riskPill neutral"}>{assessmentStatus}</span></div>
+        {signal?.signal === "BUY" && completeSignalLevels ? <>
+          <div className="signalRiskGrid"><Row name="Position risk budget" value={toCurrency(positionRiskBudget)} status={`${riskRules.riskPerTrade || 1}% of manual demo capital`} /><Row name="Estimated units" value={estimatedUnits > 0 ? estimatedUnits.toLocaleString() : "—"} status="Underlying units only; lot size unknown" /><Row name="Potential loss" value={estimatedUnits > 0 ? toCurrency(estimatedLoss) : "—"} status="Excludes charges and slippage" /><Row name="Potential reward" value={estimatedUnits > 0 ? toCurrency(estimatedUnits * signalReward) : "—"} status="Scenario, not forecast" /><Row name="Risk-to-reward" value={signalRiskReward ? `1:${signalRiskReward.toFixed(2)}` : "—"} status={signalRiskReward >= Number(riskRules.minimumRiskReward || 2) ? "Meets configured minimum" : "Below configured minimum"} /></div>
+          {riskViolation ? <p className="warningText">Signal is not risk-approved: a BUY requires stop below entry, target above entry, positive position sizing, and the configured minimum R:R.</p> : <p className="warningText">Daily loss, current drawdown, open risk, and instrument lot constraints cannot be checked because no account or trade ledger is connected. This is not a full risk approval.</p>}
+        </> : <p className="warningText">No new long-entry assessment. Missing entry, stop, or target levels are never treated as approved.</p>}
+      </section>
       <p className="warningText">{signal?.note || "Signal is a technical rule output, not a validated forecast. Quotes may be delayed; confirm current prices with your broker before acting."}</p>
       <div className="panel signalLogPanel">
         <div className="panelHead"><h3>Signal alert</h3><button className="outline" onClick={() => {
@@ -1805,7 +1901,7 @@ function OptionsTrading({symbol, setSymbol, signal, markets, market, addLog}){
   );
 }
 
-function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm, setBacktestForm, strategies, notifyTelegram, addLog}){
+function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm, setBacktestForm, strategies, savedBacktests, onLoadSavedBacktest, notifyTelegram, addLog}){
   const chartData = useMemo(() => {
     const values = backtest?.equity_curve || [];
     const labels = values.map((_, index) => backtest?.equity_timestamps?.[index]
@@ -1823,7 +1919,10 @@ function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm
       <div className="panel backtestFormPanel">
         <div className="formGrid">
           <label>Market symbol<select value={backtestForm.symbol} onChange={(event) => setBacktestForm((current) => ({...current, symbol: event.target.value}))}><option>NIFTY 50</option><option>BANK NIFTY</option><option>SENSEX</option><option>RELIANCE</option><option>TCS</option><option>INFOSYS</option><option>HDFC BANK</option><option>ICICI BANK</option><option>SBIN</option><option>ITC</option><option>BHARTI AIRTEL</option><option>BTC/USDT</option><option>ETH/USDT</option></select></label>
-          <label>Strategy<select value={backtestForm.strategy} onChange={(event) => setBacktestForm((current) => ({...current, strategy: event.target.value}))}>{strategies.map((strategy) => <option key={strategy.name}>{strategy.name}</option>)}</select></label>
+          <label>Strategy<select value={backtestForm.strategy} onChange={(event) => setBacktestForm((current) => {
+            const selected = strategies.find((strategy) => strategy.name === event.target.value);
+            return {...current, strategy: event.target.value, ...(selected?.rule === "custom" ? {stopLoss: String(selected.risk_settings?.stop_loss_pct || current.stopLoss), takeProfitRR: String(selected.risk_settings?.target_r || current.takeProfitRR)} : {})};
+          })}>{strategies.map((strategy) => <option key={strategy.name}>{strategy.name}</option>)}</select></label>
           <label>Timeframe<select value={backtestForm.timeframe} onChange={(event) => setBacktestForm((current) => {
             const timeframe = event.target.value;
             const durationUnit = maxDurationForUnit(timeframe, current.durationUnit) ? current.durationUnit : "days";
@@ -1836,6 +1935,7 @@ function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm
           <label>Initial capital<input type="number" value={backtestForm.initialCapital} onChange={(event) => setBacktestForm((current) => ({...current, initialCapital: event.target.value}))} /></label>
           <label>Position budget (₹)<input type="number" min="1" value={backtestForm.positionSize} onChange={(event) => setBacktestForm((current) => ({...current, positionSize: event.target.value}))} /></label>
           <label>Protective stop loss (%)<input type="number" min="0" step="0.1" value={backtestForm.stopLoss} onChange={(event) => setBacktestForm((current) => ({...current, stopLoss: event.target.value}))} /></label>
+          <label>Take-profit target (R)<input type="number" min="0.1" max="100" step="0.1" value={backtestForm.takeProfitRR || ""} onChange={(event) => setBacktestForm((current) => ({...current, takeProfitRR: event.target.value}))} /><small>Optional per-run override; blank uses the saved custom target when applicable.</small></label>
           <label>Estimated fee per side (bps)<input type="number" min="0" max="1000" step="1" value={backtestForm.feeBps || "10"} onChange={(event) => setBacktestForm((current) => ({...current, feeBps: event.target.value}))} /></label>
         </div>
       </div>
@@ -1852,41 +1952,102 @@ function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm
           <div className="panel chartPanel"><div className="panelHead"><h3>{backtest.symbol} performance</h3><span>{backtest.strategy} · {backtest.duration} {backtest.duration_unit} · {backtest.bar_count} bars</span></div><p className={backtest.data_source?.includes("Synthetic") ? "warningText" : "dataSourceText"}>Data: {backtest.data_source} · {backtest.period_start} to {backtest.period_end}{backtest.warning ? ` — ${backtest.warning}` : ""}</p><div className="chart"><Line data={chartData} options={{responsive: true, maintainAspectRatio: false, interaction: {mode: "index", intersect: false}, plugins: {legend: {display: false}, tooltip: {enabled: true}}, scales: {x: {grid: {display: false}, ticks: {color: "#8190a5", autoSkip: true, maxTicksLimit: 8}}, y: {beginAtZero: false, grid: {color: "rgba(255,255,255,.05)"}, ticks: {color: "#8190a5", callback: (value) => toCurrency(Number(value))}}}}} /></div></div>
         </>
       ) : <div className="empty panel">Run a backtest to calculate P&L, win rate and maximum drawdown.</div>}
+      {savedBacktests?.length > 0 && <section className="panel savedBacktestPanel"><div className="panelHead"><h3>Saved Backtest Runs</h3><span>{savedBacktests.length} recent account runs</span></div><div className="savedRunList">{savedBacktests.slice(0, 20).map((run) => <div className="savedRunRow" key={run.id}><div><strong>{run.result?.symbol || "Market"} · {run.strategy_name}</strong><small>Version {run.strategy_version || 0} · {run.result?.timeframe || "—"} · {run.created_at ? new Date(run.created_at).toLocaleString() : "Saved run"}</small></div><span className={Number(run.result?.pnl) >= 0 ? "positiveValue" : "negativeValue"}>{toCurrency(Number(run.result?.pnl || 0))}</span><button className="outline" type="button" onClick={() => onLoadSavedBacktest(run)}>Open</button></div>)}</div></section>}
     </>
   );
 }
 
-function Risk({riskRules, setRiskRules, saveRiskRules, addLog}){
+function Risk({riskRules, setRiskRules, saveRiskRules, addLog, isLoggedIn}){
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [direction, setDirection] = useState("BUY");
+  const [entryPrice, setEntryPrice] = useState("");
+  const [stopPrice, setStopPrice] = useState("");
+  const [targetPrice, setTargetPrice] = useState("");
+  const [instrument, setInstrument] = useState("NIFTY 50");
+  const [lotSize, setLotSize] = useState("1");
+  const [multiplier, setMultiplier] = useState("1");
+  const [currency, setCurrency] = useState("INR");
   const updateRule = (field, value) => { setRiskRules((current) => ({...current, [field]: value})); setSaved(false); };
-  const capitalAmount = Number(riskRules.capitalBox || 0);
-  const dailyLoss = Number(riskRules.dailyLoss || 0);
-  const capitalUsage = capitalAmount ? ((dailyLoss / capitalAmount) * 100).toFixed(1) : "0.0";
+  const balance = Number(riskRules.capitalBox || 0);
+  const entry = Number(entryPrice);
+  const stop = Number(stopPrice);
+  const target = Number(targetPrice);
+  const lot = Number(lotSize);
+  const contractMultiplier = Number(multiplier);
+  const riskDistance = direction === "BUY" ? entry - stop : stop - entry;
+  const rewardDistance = direction === "BUY" ? target - entry : entry - target;
+  const riskBudget = balance * Number(riskRules.riskPerTrade || 0) / 100;
+  const unitRisk = riskDistance * lot * contractMultiplier;
+  const lots = unitRisk > 0 ? Math.floor(riskBudget / unitRisk) : 0;
+  const quantity = lots * lot;
+  const potentialLoss = quantity * riskDistance * contractMultiplier;
+  const potentialProfit = quantity * rewardDistance * contractMultiplier;
+  const riskReward = riskDistance > 0 && rewardDistance > 0 ? rewardDistance / riskDistance : null;
+  const money = (value) => `${currency === "INR" ? "₹" : "$"}${Number(value).toLocaleString(currency === "INR" ? "en-IN" : "en-US", {maximumFractionDigits: 2})}`;
+
+  async function submitRiskRules(event){
+    setSaveError("");
+    try {
+      await saveRiskRules(event);
+      setSaved(true);
+      addLog("Risk rules saved to your account.", "success");
+    } catch (error) {
+      event.preventDefault();
+      setSaveError(error.message);
+    }
+  }
 
   return (
     <>
-      <div className="pageHead"><div><p className="eyebrow">PROTECTION</p><h1>Risk Management</h1><p>Configure limits and monitor portfolio risk.</p></div></div>
-      <div className="riskGrid">
-        <form className="panel" onSubmit={(event) => { saveRiskRules(event); setSaved(true); addLog("Risk rules saved.", "success"); }}>
-          <h3>Risk Rules</h3>
-          <label>Stop Loss %<input type="number" min="0" step="0.1" value={riskRules.stopLoss} onChange={(event) => updateRule("stopLoss", event.target.value)} /></label>
-          <label>Maximum Drawdown %<input type="number" min="0" step="0.1" value={riskRules.maxDrawdown} onChange={(event) => updateRule("maxDrawdown", event.target.value)} /></label>
-          <label>Capital Box<input type="number" min="0" step="1000" value={riskRules.capitalBox} onChange={(event) => updateRule("capitalBox", event.target.value)} /></label>
-          <label>Daily Loss Limit<input type="number" min="0" step="100" value={riskRules.dailyLoss} onChange={(event) => updateRule("dailyLoss", event.target.value)} /></label>
-          <button className="primary" type="submit">Save Risk Rules</button>
-          {saved && <span role="status">Saved on this device.</span>}
-        </form>
-        <div className="panel">
-          <h3>Risk Status</h3>
-          <div className="safe">✓ Portfolio within configured risk limits</div>
-          <Row name="Capital box" value={`₹${Number(riskRules.capitalBox || 0).toLocaleString()}`} status="Allocated" />
-          <Row name="Stop loss" value={`${riskRules.stopLoss}%`} status="Active" />
-          <Row name="Max drawdown" value={`${riskRules.maxDrawdown}%`} status="Active" />
-          <Row name="Daily loss limit" value={`₹${Number(riskRules.dailyLoss).toLocaleString()}`} status="Active" />
-          <Row name="Capital usage" value={`${capitalUsage}%`} status="Current" />
-          <Row name="Alerts" value="ON" status="Enabled" />
-        </div>
+      <div className="pageHead"><div><p className="eyebrow">PROTECTION</p><h1>Risk Management</h1><p>Rule-based limits and position sizing. Passing a check is not a profitability guarantee.</p></div><span className="statusBadge">{isLoggedIn ? "ACCOUNT SETTINGS" : "SIGN IN TO SAVE"}</span></div>
+      <div className="riskOverview">
+        <div className="riskMetric"><span>Configured balance</span><strong>{money(balance)}</strong><small>Manual demo capital, not a connected broker balance</small></div>
+        <div className="riskMetric"><span>Available trading capital</span><strong>{money(balance)}</strong><small>Estimate based on configured demo capital</small></div>
+        <div className="riskMetric"><span>Today's P&amp;L</span><strong>Not available</strong><small>No platform trade ledger connected</small></div>
+        <div className="riskMetric"><span>Current drawdown</span><strong>Not available</strong><small>No actual account equity history</small></div>
       </div>
+      <div className="riskOverview riskOverviewSecondary">
+        <div className="riskMetric"><span>Total open risk</span><strong>Not available</strong><small>Open positions are not synced</small></div>
+        <div className="riskMetric"><span>Daily loss allowance</span><strong>{money(Number(riskRules.dailyLoss || 0))}</strong><small>Limit configured; usage cannot be verified</small></div>
+      </div>
+      <div className="riskWorkspace">
+        <form className="panel riskRulesForm" onSubmit={submitRiskRules}>
+          <div className="panelHead"><h3>Risk Rules</h3><span>{isLoggedIn ? "Saved per account" : "Sign in required"}</span></div>
+          <label>Manual demo capital ({currency})<input type="number" min="1" step="1000" value={riskRules.capitalBox || ""} onChange={(event) => updateRule("capitalBox", event.target.value)} required /></label>
+          <label>Default risk per trade (%)<input type="number" min="0.01" max="100" step="0.1" value={riskRules.riskPerTrade || "1"} onChange={(event) => updateRule("riskPerTrade", event.target.value)} required /></label>
+          <label>Maximum daily loss ({currency})<input type="number" min="0" step="100" value={riskRules.dailyLoss || "0"} onChange={(event) => updateRule("dailyLoss", event.target.value)} /></label>
+          <label>Maximum drawdown (%)<input type="number" min="0" max="100" step="0.1" value={riskRules.maxDrawdown || "8"} onChange={(event) => updateRule("maxDrawdown", event.target.value)} /></label>
+          <label>Maximum trades per day<input type="number" min="1" step="1" value={riskRules.maxTradesPerDay || "5"} onChange={(event) => updateRule("maxTradesPerDay", event.target.value)} /></label>
+          <label>Minimum risk-to-reward<input type="number" min="0.1" step="0.1" value={riskRules.minimumRiskReward || "2"} onChange={(event) => updateRule("minimumRiskReward", event.target.value)} /></label>
+          <label>Display currency<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="INR">INR (₹)</option><option value="USD">USD ($)</option></select></label>
+          <button className="primary" type="submit" disabled={!isLoggedIn}>Save Risk Rules</button>
+          {saved && <span role="status">Saved to your account.</span>}
+          {saveError && <p className="warningText" role="alert">{saveError}</p>}
+        </form>
+        <section className="panel calculatorPanel">
+          <div className="panelHead"><h3>Position Size &amp; R:R Calculator</h3><span>Uses your configured balance and risk</span></div>
+          <div className="calculatorGrid">
+            <label>Instrument<select value={instrument} onChange={(event) => setInstrument(event.target.value)}>{["NIFTY 50", "BANK NIFTY", "SENSEX", "GOLD", "SILVER", "BTC/USDT", "ETH/USDT", "Forex pair", "Custom"].map((item) => <option key={item}>{item}</option>)}</select></label>
+            <label>Direction<select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label>
+            <label>Entry price<input type="number" min="0" step="any" value={entryPrice} onChange={(event) => setEntryPrice(event.target.value)} /></label>
+            <label>Stop-loss price<input type="number" min="0" step="any" value={stopPrice} onChange={(event) => setStopPrice(event.target.value)} /></label>
+            <label>Target price<input type="number" min="0" step="any" value={targetPrice} onChange={(event) => setTargetPrice(event.target.value)} /></label>
+            <label>Lot size<input type="number" min="1" step="1" value={lotSize} onChange={(event) => setLotSize(event.target.value)} /></label>
+            <label>Contract multiplier<input type="number" min="0.000001" step="any" value={multiplier} onChange={(event) => setMultiplier(event.target.value)} /></label>
+          </div>
+          <div className="calculatorResults">
+            <Row name="Maximum risk budget" value={money(riskBudget)} status={`${riskRules.riskPerTrade || 1}% of demo balance`} />
+            <Row name="Recommended quantity" value={Number.isFinite(quantity) && quantity > 0 ? quantity.toLocaleString() : "—"} status={lots > 0 ? `${lots} lot(s)` : "Check prices and lot size"} />
+            <Row name="Potential loss" value={potentialLoss > 0 ? money(potentialLoss) : "—"} status="Before fees and slippage" />
+            <Row name="Potential profit" value={potentialProfit > 0 ? money(potentialProfit) : "—"} status="Before fees and slippage" />
+            <Row name="Risk-to-reward" value={riskReward ? `1:${riskReward.toFixed(2)}` : "—"} status={riskReward && riskReward >= Number(riskRules.minimumRiskReward || 2) ? "Meets configured minimum" : "Below minimum or incomplete"} />
+            <Row name="Break-even win rate" value={riskReward ? `${(100 / (1 + riskReward)).toFixed(1)}%` : "—"} status="Excludes costs" />
+          </div>
+          <p className="warningText">{instrument}: set lot size and contract multiplier from current contract specifications. The calculator does not fetch broker lot sizes, taxes, or option premiums.</p>
+        </section>
+      </div>
+      <section className="panel drawdownNotice"><div><p className="eyebrow">DRAWDOWN MONITOR</p><h3>Equity history unavailable</h3><p>There is no connected account equity stream or completed-trade ledger, so drawdown, discipline statistics, daily lockout, and live risk alerts cannot be truthfully calculated yet.</p></div><Row name="Configured maximum drawdown" value={`${riskRules.maxDrawdown || 8}%`} status="Rule only; no observed equity" /></section>
     </>
   );
 }
@@ -1903,40 +2064,176 @@ function Reports({backtest, exportReport, exportMessage, notifyTelegram}){
   );
 }
 
-function Strategies({strategies, addStrategy, configureStrategy, addLog}){
-  const [showNew, setShowNew] = useState(false);
-  const [newName, setNewName] = useState("");
-  const [newError, setNewError] = useState("");
-  const [newRule, setNewRule] = useState("price_action_retest");
-  const [editing, setEditing] = useState(null);
-  const [editRisk, setEditRisk] = useState("Medium");
-  const selectedTemplate = defaultStrategies.find((strategy) => strategy.rule === newRule) || defaultStrategies[0];
+function Strategies({strategies, saveStrategy, removeStrategy, onBacktest, savedBacktests, addLog, isLoggedIn}){
+  const blankCondition = () => ({leftIndicator: "EMA", leftPeriod: "20", operator: "gt", rightMode: "indicator", rightIndicator: "EMA", rightPeriod: "50", rightValue: ""});
+  const blankDraft = () => ({name: "", description: "", category: "Trend", symbol: "NIFTY 50", timeframe: "15m", direction: "Long", entryLogic: "AND", exitLogic: "OR", entryConditions: [blankCondition()], exitConditions: [ {...blankCondition(), leftIndicator: "CLOSE", operator: "lt", rightIndicator: "EMA", rightPeriod: "20"} ], stopLossPct: "1.5", targetR: "2", active: true});
+  const [showBuilder, setShowBuilder] = useState(false);
+  const [draft, setDraft] = useState(blankDraft);
+  const [validationMessage, setValidationMessage] = useState("");
+  const [saveError, setSaveError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [viewing, setViewing] = useState(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
-  function submitNewStrategy(event){
-    event.preventDefault();
-    if (!addStrategy(newName, newRule)) { setNewError("Enter a unique strategy name."); return; }
-    addLog(`Created new strategy: ${newName.trim()}.`, "success");
-    setNewName(""); setNewError(""); setShowNew(false);
-  }
+  const indicatorChoices = ["CLOSE", "OPEN", "HIGH", "LOW", "VOLUME", "VOLUME_AVERAGE", "EMA", "SMA", "RSI", "ATR"];
+  const operatorChoices = [["gt", "is above"], ["gte", "is at least"], ["lt", "is below"], ["lte", "is at most"], ["crosses_above", "crosses above"], ["crosses_below", "crosses below"]];
+  const indicatorNeedsPeriod = (indicator) => ["EMA", "SMA", "RSI", "ATR", "VOLUME_AVERAGE"].includes(indicator);
+  const describe = (condition) => `${condition.leftIndicator}${indicatorNeedsPeriod(condition.leftIndicator) ? ` ${condition.leftPeriod}` : ""} ${operatorChoices.find(([key]) => key === condition.operator)?.[1] || condition.operator} ${condition.rightMode === "indicator" ? `${condition.rightIndicator}${indicatorNeedsPeriod(condition.rightIndicator) ? ` ${condition.rightPeriod}` : ""}` : condition.rightValue || "?"}`;
+  const rowsFromGroup = (group, fallback) => {
+    if (!group || !Array.isArray(group.conditions)) return fallback;
+    return group.conditions.filter((item) => !item.logic).map((item) => ({
+      leftIndicator: item.left?.indicator || "CLOSE",
+      leftPeriod: String(item.left?.period || 14),
+      operator: item.operator || "gt",
+      rightMode: typeof item.right === "object" ? "indicator" : "value",
+      rightIndicator: item.right?.indicator || "EMA",
+      rightPeriod: String(item.right?.period || 14),
+      rightValue: typeof item.right === "number" ? String(item.right) : ""
+    })).filter(Boolean).length ? group.conditions.filter((item) => !item.logic).map((item) => ({
+      leftIndicator: item.left?.indicator || "CLOSE", leftPeriod: String(item.left?.period || 14), operator: item.operator || "gt",
+      rightMode: typeof item.right === "object" ? "indicator" : "value", rightIndicator: item.right?.indicator || "EMA",
+      rightPeriod: String(item.right?.period || 14), rightValue: typeof item.right === "number" ? String(item.right) : ""
+    })) : fallback;
+  };
 
-  function openConfiguration(strategy){
-    setEditing(strategy.name);
-    setEditRisk(strategy.risk);
-  }
-
-  function saveConfiguration(event, strategyName){
-    event.preventDefault();
-    if (configureStrategy(strategyName, editRisk)) {
-      addLog(`Updated ${strategyName} to ${editRisk} risk.`, "success");
-      setEditing(null);
+  function openBuilder(strategy = null){
+    if (!isLoggedIn) { setSaveError("Sign in to create and save private strategies."); setShowBuilder(true); return; }
+    const base = blankDraft();
+    if (strategy?.rule === "custom") {
+      const definition = JSON.parse(JSON.stringify(strategy));
+      setDraft({
+        ...base, id: strategy.id, name: strategy.name, description: strategy.description || "", category: strategy.category || "Custom",
+        symbol: strategy.symbol || base.symbol, timeframe: strategy.timeframe || base.timeframe, direction: strategy.direction || "Long",
+        entryLogic: strategy.entry?.logic || "AND", exitLogic: strategy.exit?.logic || "OR",
+        entryConditions: rowsFromGroup(strategy.entry, base.entryConditions), exitConditions: rowsFromGroup(strategy.exit, base.exitConditions),
+        stopLossPct: String(strategy.risk_settings?.stop_loss_pct || 1.5), targetR: String(strategy.risk_settings?.target_r || 2),
+        active: strategy.active !== false, existingDefinition: definition
+      });
+    } else {
+      setDraft(base);
     }
+    setValidationMessage("");
+    setSaveError("");
+    setShowBuilder(true);
+  }
+
+  function buildGroup(logic, rows){
+    return {logic, conditions: rows.map((condition) => {
+      const left = {indicator: condition.leftIndicator};
+      const right = condition.rightMode === "indicator" ? {indicator: condition.rightIndicator} : Number(condition.rightValue);
+      if (indicatorNeedsPeriod(condition.leftIndicator)) left.period = Number(condition.leftPeriod);
+      if (condition.rightMode === "indicator" && indicatorNeedsPeriod(condition.rightIndicator)) right.period = Number(condition.rightPeriod);
+      return {...condition, left, operator: condition.operator, right};
+    })};
+  }
+
+  function validateDraft(){
+    if (!draft.name.trim()) return "Add a strategy name.";
+    if (!draft.entryConditions.length || !draft.exitConditions.length) return "At least one entry and one exit condition are required.";
+    for (const condition of [...draft.entryConditions, ...draft.exitConditions]) {
+      if (indicatorNeedsPeriod(condition.leftIndicator) && !(Number(condition.leftPeriod) >= 1 && Number(condition.leftPeriod) <= 500)) return "Indicator periods must be between 1 and 500.";
+      if (condition.rightMode === "indicator" && indicatorNeedsPeriod(condition.rightIndicator) && !(Number(condition.rightPeriod) >= 1 && Number(condition.rightPeriod) <= 500)) return "Indicator periods must be between 1 and 500.";
+      if (condition.rightMode === "value" && (!condition.rightValue.trim() || !Number.isFinite(Number(condition.rightValue)))) return "Enter a finite comparison value for every numeric condition.";
+    }
+    if ((draft.entryLogic === "NOT" && draft.entryConditions.length !== 1) || (draft.exitLogic === "NOT" && draft.exitConditions.length !== 1)) return "NOT groups require exactly one condition.";
+    if (!(Number(draft.stopLossPct) > 0) || !(Number(draft.targetR) > 0)) return "Stop-loss percent and target R must be greater than zero.";
+    return "Strategy definition is valid for the supported long-only rule engine.";
+  }
+
+  async function submitDraft(event){
+    event.preventDefault();
+    const validation = validateDraft();
+    setValidationMessage(validation);
+    if (!validation.startsWith("Strategy definition")) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const {id, existingDefinition, entryLogic, exitLogic, entryConditions, exitConditions, stopLossPct, targetR, ...metadata} = draft;
+      const saved = await saveStrategy({
+        ...(id ? {id} : {}), ...metadata,
+        entry: buildGroup(entryLogic, entryConditions), exit: buildGroup(exitLogic, exitConditions),
+        risk_settings: {stop_loss_pct: Number(stopLossPct), target_r: Number(targetR)}
+      });
+      addLog(`${id ? "Updated" : "Created"} custom strategy ${saved.name} (version ${saved.version}).`, "success");
+      setShowBuilder(false);
+    } catch (error) {
+      setSaveError(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function duplicateStrategy(strategy){
+    if (strategy.rule !== "custom") {
+      setSaveError("Built-in template rules cannot be duplicated as custom rules until all their price-action semantics are represented by the builder.");
+      setShowBuilder(true);
+      return;
+    }
+    openBuilder(strategy);
+    setDraft((current) => ({...current, id: undefined, name: `${strategy.name} copy`}));
+  }
+
+  function updateCondition(groupName, index, field, value){
+    setDraft((current) => ({...current, [groupName]: current[groupName].map((condition, conditionIndex) => conditionIndex === index ? {...condition, [field]: value} : condition)}));
+  }
+
+  function conditionEditor(title, groupName, logicName){
+    const rows = draft[groupName];
+    return <section className="builderConditionSection">
+      <div className="panelHead"><h3>{title}</h3><label>Combine<select value={draft[logicName]} onChange={(event) => setDraft((current) => ({...current, [logicName]: event.target.value}))}><option value="AND">All (AND)</option><option value="OR">Any (OR)</option></select></label></div>
+      {rows.map((condition, index) => <div className="conditionRow" key={`${groupName}-${index}`}>
+        <label>Left<select value={condition.leftIndicator} onChange={(event) => updateCondition(groupName, index, "leftIndicator", event.target.value)}>{indicatorChoices.map((item) => <option key={item}>{item}</option>)}</select></label>
+        {indicatorNeedsPeriod(condition.leftIndicator) && <label>Period<input type="number" min="1" max="500" value={condition.leftPeriod} onChange={(event) => updateCondition(groupName, index, "leftPeriod", event.target.value)} /></label>}
+        <label>Operator<select value={condition.operator} onChange={(event) => updateCondition(groupName, index, "operator", event.target.value)}>{operatorChoices.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
+        <label>Compare to<select value={condition.rightMode} onChange={(event) => updateCondition(groupName, index, "rightMode", event.target.value)}><option value="indicator">Indicator</option><option value="value">Number</option></select></label>
+        {condition.rightMode === "indicator" ? <><label>Right<select value={condition.rightIndicator} onChange={(event) => updateCondition(groupName, index, "rightIndicator", event.target.value)}>{indicatorChoices.map((item) => <option key={item}>{item}</option>)}</select></label>{indicatorNeedsPeriod(condition.rightIndicator) && <label>Period<input type="number" min="1" max="500" value={condition.rightPeriod} onChange={(event) => updateCondition(groupName, index, "rightPeriod", event.target.value)} /></label>}</> : <label>Value<input type="number" step="any" value={condition.rightValue} onChange={(event) => updateCondition(groupName, index, "rightValue", event.target.value)} /></label>}
+        <button className="iconButton" type="button" aria-label={`Remove ${title.toLowerCase()} condition ${index + 1}`} onClick={() => setDraft((current) => ({...current, [groupName]: current[groupName].filter((_, conditionIndex) => conditionIndex !== index)}))} disabled={rows.length === 1}>Remove</button>
+      </div>)}
+      <button className="outline" type="button" onClick={() => setDraft((current) => ({...current, [groupName]: [...current[groupName], blankCondition()]}))} disabled={rows.length >= 100}>Add condition</button>
+    </section>;
   }
 
   return (
     <>
-      <div className="pageHead"><div><p className="eyebrow">CONFIGURATION</p><h1>Trading Strategies</h1><p>Create and manage rule-based strategies.</p></div><button className="primary" onClick={() => { setShowNew(true); setNewError(""); }}>+ New Strategy</button></div>
-      {showNew && <form className="panel" onSubmit={submitNewStrategy}><label>Strategy name<input autoFocus maxLength="40" value={newName} onChange={(event) => { setNewName(event.target.value); setNewError(""); }} required /></label><label>Executable rule template<select value={newRule} onChange={(event) => setNewRule(event.target.value)}>{defaultStrategies.map((strategy) => <option key={strategy.rule} value={strategy.rule}>{strategy.name}</option>)}</select></label><p>{selectedTemplate.description}</p><p><b>Entry:</b> {selectedTemplate.entryRules.join(" ")}</p><p><b>Exit:</b> {selectedTemplate.exitRules.join(" ")}</p><p>A custom name selects this rule template; it does not create new trading logic.</p>{newError && <span role="alert">{newError}</span>}<button className="primary" type="submit">Create Strategy</button><button className="outline" type="button" onClick={() => setShowNew(false)}>Cancel</button></form>}
-      <div className="strategyGrid">{strategies.map((strategy) => <div className="panel strategy" key={strategy.name}><span className={`badge ${strategy.status === "READY" ? "muted" : ""}`}>{strategy.status}</span><h3>{strategy.name}</h3><p>{strategy.description}</p><p><b>Entry:</b> {(strategy.entryRules || []).join(" ") || "Rule details unavailable for this saved custom strategy."}</p><p><b>Exit:</b> {(strategy.exitRules || []).join(" ") || "Rule details unavailable for this saved custom strategy."}</p><Row name="Risk" value={strategy.risk} status="User setting only" /><button className="outline" onClick={() => editing === strategy.name ? setEditing(null) : openConfiguration(strategy)}>{editing === strategy.name ? "Close configuration" : "Configure"}</button>{editing === strategy.name && <form onSubmit={(event) => saveConfiguration(event, strategy.name)}><label>Risk level<select value={editRisk} onChange={(event) => setEditRisk(event.target.value)}><option>Low</option><option>Medium</option><option>High</option></select></label><button className="primary" type="submit">Save configuration</button></form>}</div>)}</div>
+      <div className="pageHead"><div><p className="eyebrow">STRATEGY LAB</p><h1>Strategies</h1><p>Build, version, inspect, and backtest executable trading rules.</p></div><button className="primary" onClick={() => openBuilder()}>Create Custom Strategy</button></div>
+      {!isLoggedIn && <p className="warningText">Sign in to save, edit, or backtest private custom strategies. Built-in strategies remain available.</p>}
+      <section className="strategySection"><div className="sectionHeading"><div><p className="eyebrow">MY STRATEGIES</p><h2>Saved rules</h2></div><span>{strategies.filter((item) => item.rule === "custom").length} custom</span></div>
+        <div className="strategyGrid">{strategies.map((strategy) => {
+          const isCustom = strategy.rule === "custom";
+          const entrySummary = isCustom ? (strategy.entry?.conditions || []).map((condition) => condition.logic ? "Nested rule group" : `${condition.left?.indicator || "?"} ${condition.operator} ${typeof condition.right === "object" ? condition.right.indicator : condition.right}`).join(strategy.entry?.logic === "OR" ? " OR " : " AND ") : strategy.entryRules?.join(" ");
+          const exitSummary = isCustom ? (strategy.exit?.conditions || []).map((condition) => condition.logic ? "Nested rule group" : `${condition.left?.indicator || "?"} ${condition.operator} ${typeof condition.right === "object" ? condition.right.indicator : condition.right}`).join(strategy.exit?.logic === "AND" ? " AND " : " OR ") : strategy.exitRules?.join(" ");
+          return <article className="panel strategyCard" key={strategy.id || strategy.rule}>
+            <div className="strategyCardTop"><span className={`badge ${isCustom ? "" : "muted"}`}>{isCustom ? `CUSTOM · V${strategy.version || 1}` : "BUILT IN"}</span><span className={strategy.active === false ? "statusInactive" : "statusActive"}>{strategy.active === false ? "Inactive" : "Active"}</span></div>
+            <h3>{strategy.name}</h3><p>{strategy.description || strategy.style || "Rule-based strategy"}</p>
+            <div className="strategyRuleSummary"><b>Entry</b><span>{entrySummary || "No entry summary"}</span><b>Exit</b><span>{exitSummary || "No exit summary"}</span></div>
+            <div className="strategyMeta"><span>{strategy.category || "Technical"}</span><span>{strategy.direction || "Long"}</span><span>{strategy.symbol || "Multi-market"}</span><span>{strategy.timeframe || "Multiple timeframes"}</span><span>{strategy.risk || "Risk configured per backtest"}</span></div>
+            <div className="strategyActions"><button className="outline" type="button" onClick={() => setViewing(viewing === strategy.name ? null : strategy.name)}>View Details</button><button className="outline" type="button" onClick={() => onBacktest(strategy)}>Backtest</button>{isCustom && <><button className="outline" type="button" onClick={() => openBuilder(strategy)}>Edit</button><button className="outline" type="button" onClick={() => duplicateStrategy(strategy)}>Duplicate</button><button className="outline" type="button" onClick={async () => { try { await saveStrategy({...strategy, active: strategy.active === false}); } catch (error) { setSaveError(error.message); } }}>Activate / Deactivate</button><button className="dangerButton" type="button" onClick={async () => { try { await removeStrategy(strategy); } catch (error) { setSaveError(error.message); } }}>Delete</button></>}</div>
+            {viewing === strategy.name && <div className="strategyDetail"><Row name="Category" value={strategy.category || "Built-in"} status="" /><Row name="Direction" value={strategy.direction || "Long only"} status="" /><Row name="Backtests" value={strategy.backtest_count ?? savedBacktests.filter((run) => run.strategy_name === strategy.name).length} status="Saved runs" />{strategy.latest_backtest?.result && <><Row name="Latest P&L" value={toCurrency(strategy.latest_backtest.result.pnl)} status={`${strategy.latest_backtest.result.win_rate ?? "—"}% win rate`} /><Row name="Profit factor" value={strategy.latest_backtest.result.profit_factor ?? "—"} status={`Max DD ${strategy.latest_backtest.result.max_drawdown ?? "—"}%`} /></>}<p>{isCustom ? `Version ${strategy.version || 1} · ${strategy.updated_at || "Saved to account"}` : "Built-in rule documentation"}</p></div>}
+          </article>;
+        })}</div>
+      </section>
+      <section className="strategySection"><div className="sectionHeading"><div><p className="eyebrow">STRATEGY TEMPLATES</p><h2>Executable built-ins</h2></div></div><div className="templateList">{defaultStrategies.map((template) => <div className="templateRow" key={template.rule}><div><strong>{template.name}</strong><p>{template.description}</p></div><button className="outline" type="button" onClick={() => onBacktest(template)}>Backtest template</button></div>)}</div></section>
+      <section className="strategySection"><div className="sectionHeading"><div><p className="eyebrow">STRATEGY PERFORMANCE</p><h2>Recent saved results</h2></div><span>Actual completed backtests only</span></div>{savedBacktests.length ? <div className="templateList">{savedBacktests.slice(0, 10).map((run) => <div className="templateRow" key={`performance-${run.id}`}><div><strong>{run.strategy_name} · {run.result?.symbol || "Market"}</strong><p>Net P&amp;L {toCurrency(Number(run.result?.pnl || 0))} · {run.result?.trades || 0} trades · {run.result?.win_rate ?? "—"}% win rate · {run.result?.max_drawdown ?? "—"}% max drawdown</p></div><button className="outline" type="button" onClick={() => onBacktest({name: run.strategy_name, symbol: run.result?.symbol, timeframe: run.result?.timeframe})}>Run again</button></div>)}</div> : <p className="empty panel">No saved backtest performance is available for this account yet.</p>}</section>
+      {saveError && <p className="warningText" role="alert">{saveError}</p>}
+      {showBuilder && <div className="builderBackdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowBuilder(false); }}><form className="strategyBuilder" onSubmit={submitDraft}>
+        <div className="builderHeader"><div><p className="eyebrow">NO-CODE RULE EDITOR</p><h2>{draft.id ? `Edit ${draft.name}` : "Create custom strategy"}</h2></div><button className="iconButton" type="button" aria-label="Close strategy builder" onClick={() => setShowBuilder(false)}>Close</button></div>
+        {!isLoggedIn ? <p className="warningText">Sign in to save private strategy definitions.</p> : <>
+          <section className="builderBasic"><h3>Basic information</h3><div className="builderGrid">
+            <label>Strategy name<input maxLength="80" value={draft.name} onChange={(event) => setDraft((current) => ({...current, name: event.target.value}))} required /></label>
+            <label>Category<select value={draft.category} onChange={(event) => setDraft((current) => ({...current, category: event.target.value}))}><option>Trend</option><option>Mean reversion</option><option>Breakout</option><option>Price action</option><option>Custom</option></select></label>
+            <label>Instrument<select value={draft.symbol} onChange={(event) => setDraft((current) => ({...current, symbol: event.target.value}))}>{[...new Set(["NIFTY 50", "BANK NIFTY", "SENSEX", "RELIANCE", "BTC/USDT", "ETH/USDT", draft.symbol])].map((item) => <option key={item}>{item}</option>)}</select></label>
+            <label>Timeframe<select value={draft.timeframe} onChange={(event) => setDraft((current) => ({...current, timeframe: event.target.value}))}>{["1m", "5m", "15m", "30m", "60m", "1d", "1wk"].map((item) => <option key={item}>{item}</option>)}</select></label>
+            <label>Direction<select value={draft.direction} onChange={(event) => setDraft((current) => ({...current, direction: event.target.value}))}><option>Long</option><option disabled>Short (not supported by current simulator)</option><option disabled>Both (not supported by current simulator)</option></select></label>
+            <label>Description<input maxLength="1000" value={draft.description} onChange={(event) => setDraft((current) => ({...current, description: event.target.value}))} /></label>
+          </div></section>
+          {conditionEditor("Entry conditions", "entryConditions", "entryLogic")}
+          {conditionEditor("Exit conditions", "exitConditions", "exitLogic")}
+          <details className="builderAdvanced" open={showAdvanced} onToggle={(event) => setShowAdvanced(event.currentTarget.open)}><summary>Risk and execution settings</summary><div className="builderGrid"><label>Protective stop loss (%)<input type="number" min="0.01" max="100" step="0.1" value={draft.stopLossPct} onChange={(event) => setDraft((current) => ({...current, stopLossPct: event.target.value}))} /></label><label>Target risk multiple<input type="number" min="0.1" step="0.1" value={draft.targetR} onChange={(event) => setDraft((current) => ({...current, targetR: event.target.value}))} /></label></div></details>
+          <section className="logicPreview"><p className="eyebrow">LOGIC PREVIEW</p><h3>{draft.name || "Untitled strategy"}</h3><p><b>Entry ({draft.entryLogic}):</b> {draft.entryConditions.map(describe).join(draft.entryLogic === "AND" ? " AND " : " OR ")}</p><p><b>Exit ({draft.exitLogic}):</b> {draft.exitConditions.map(describe).join(draft.exitLogic === "AND" ? " AND " : " OR ")}</p><p><b>Risk:</b> {draft.stopLossPct}% protective stop · {draft.targetR}R target · {draft.direction} only · {draft.timeframe}</p></section>
+          <div className="builderFooter"><button className="outline" type="button" onClick={() => setValidationMessage(validateDraft())}>Validate rules</button><span role="status">{validationMessage}</span><button className="primary" type="submit" disabled={saving}>{saving ? "Saving…" : draft.id ? "Save new version" : "Save strategy"}</button></div>
+          {saveError && <p className="warningText" role="alert">{saveError}</p>}
+        </>}
+      </form></div>}
     </>
   );
 }

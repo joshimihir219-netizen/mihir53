@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
 from ml_engine import generate_signal
-from backtest import run_backtest
+from backtest import custom_strategy_mask, run_backtest
 from backtest import STRATEGIES
 from market_data import TIMEFRAME_HISTORY, market_frame, _duration_offset, _max_duration
 from angel_options import get_live_option_signal
@@ -53,6 +53,23 @@ class TelegramMessage(BaseModel):
     bot_token: str = Field(min_length=1, max_length=128)
     chat_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=4096)
+
+
+class StrategyPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=1000)
+    category: str = Field(default="Custom", max_length=60)
+    symbol: str = Field(default="NIFTY 50", max_length=40)
+    timeframe: str = Field(default="15m", pattern="^(1m|2m|5m|15m|30m|60m|90m|1h|1d|5d|1wk|1mo|3mo)$")
+    direction: str = Field(default="Long", pattern="^(Long|Short|Both)$")
+    entry: dict
+    exit: dict
+    risk_settings: dict = Field(default_factory=dict)
+    active: bool = True
+
+
+class RiskSettingsPayload(BaseModel):
+    settings: dict
 
 
 @contextmanager
@@ -138,6 +155,58 @@ def _initialize_auth_db():
             connection,
             "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username))",
         )
+        if DATABASE_URL:
+            strategy_id = "BIGSERIAL PRIMARY KEY"
+            user_id_type = "BIGINT"
+        else:
+            strategy_id = "INTEGER PRIMARY KEY AUTOINCREMENT"
+            user_id_type = "INTEGER"
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS strategies (
+                id {strategy_id},
+                user_id {user_id_type} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS strategy_versions (
+                id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
+                strategy_id {"BIGINT" if DATABASE_URL else "INTEGER"} NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL,
+                definition TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(strategy_id, version)
+            )
+        """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS user_risk_settings (
+                user_id {user_id_type} PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                settings TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
+                user_id {user_id_type} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                strategy_id {"BIGINT" if DATABASE_URL else "INTEGER"},
+                strategy_name TEXT NOT NULL,
+                strategy_version INTEGER NOT NULL,
+                strategy_snapshot TEXT NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
 
 _initialize_auth_db()
@@ -230,6 +299,165 @@ def current_user(authorization: str | None = Header(default=None)):
             _execute(connection, "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
     return {"username": user["username"]}
+
+
+def _authenticated_user_id(authorization: str | None) -> int:
+    username = current_user(authorization)["username"]
+    with _auth_connection() as connection:
+        user = _execute(connection, "SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Account is no longer available.")
+    return int(user["id"])
+
+
+def _strategy_record(row):
+    payload = json.loads(row["definition"])
+    return {
+        "id": int(row["id"]),
+        **payload,
+        "version": int(row["version"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "rule": "custom",
+    }
+
+
+def _validate_strategy_payload(payload: StrategyPayload):
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="Strategy name cannot be blank.")
+    if payload.direction != "Long":
+        raise HTTPException(status_code=422, detail="The current strategy simulator supports long-only custom rules.")
+    sample = pd.DataFrame({
+        "open": [100.0] * 600,
+        "high": [101.0] * 600,
+        "low": [99.0] * 600,
+        "close": [100.0] * 600,
+        "volume": [1000.0] * 600,
+    })
+    try:
+        custom_strategy_mask(sample, {"entry": payload.entry, "exit": payload.exit})
+    except (TypeError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=422, detail=f"Invalid strategy conditions: {error}") from error
+
+
+@app.get("/api/strategies")
+def list_strategies(authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(connection, "SELECT * FROM strategies WHERE user_id = ? ORDER BY updated_at DESC", (user_id,)).fetchall()
+        run_rows = _execute(connection, "SELECT strategy_id, strategy_name, result, created_at FROM backtest_runs WHERE user_id = ? ORDER BY created_at DESC", (user_id,)).fetchall()
+    latest_by_id = {}
+    counts_by_id = {}
+    for run in run_rows:
+        if run["strategy_id"] is None:
+            continue
+        strategy_id = int(run["strategy_id"])
+        counts_by_id[strategy_id] = counts_by_id.get(strategy_id, 0) + 1
+        latest_by_id.setdefault(strategy_id, {"created_at": run["created_at"], "result": json.loads(run["result"])})
+    result = []
+    for row in rows:
+        strategy = _strategy_record(row)
+        strategy["backtest_count"] = counts_by_id.get(strategy["id"], 0)
+        strategy["latest_backtest"] = latest_by_id.get(strategy["id"])
+        result.append(strategy)
+    return result
+
+
+@app.post("/api/strategies", status_code=201)
+def create_strategy(payload: StrategyPayload, authorization: str | None = Header(default=None)):
+    _validate_strategy_payload(payload)
+    user_id = _authenticated_user_id(authorization)
+    definition = payload.model_dump()
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        if DATABASE_URL:
+            row = _execute(connection, """
+                INSERT INTO strategies (user_id, name, description, category, symbol, timeframe, direction, definition, version, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING id
+            """, (user_id, payload.name.strip(), payload.description, payload.category, payload.symbol,
+                   payload.timeframe, payload.direction, json.dumps(definition), int(payload.active), now, now)).fetchone()
+            strategy_id = int(row["id"])
+        else:
+            cursor = _execute(connection, """
+                INSERT INTO strategies (user_id, name, description, category, symbol, timeframe, direction, definition, version, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """, (user_id, payload.name.strip(), payload.description, payload.category, payload.symbol,
+                   payload.timeframe, payload.direction, json.dumps(definition), int(payload.active), now, now))
+            strategy_id = int(cursor.lastrowid)
+        _execute(connection, "INSERT INTO strategy_versions (strategy_id, version, definition, created_at) VALUES (?, 1, ?, ?)",
+                 (strategy_id, json.dumps(definition), now))
+        row = _execute(connection, "SELECT * FROM strategies WHERE id = ? AND user_id = ?", (strategy_id, user_id)).fetchone()
+    return _strategy_record(row)
+
+
+@app.put("/api/strategies/{strategy_id}")
+def update_strategy(strategy_id: int, payload: StrategyPayload, authorization: str | None = Header(default=None)):
+    _validate_strategy_payload(payload)
+    user_id = _authenticated_user_id(authorization)
+    definition = payload.model_dump()
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        row = _execute(connection, "SELECT version FROM strategies WHERE id = ? AND user_id = ?", (strategy_id, user_id)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Strategy not found.")
+        version = int(row["version"]) + 1
+        _execute(connection, """
+            UPDATE strategies SET name = ?, description = ?, category = ?, symbol = ?, timeframe = ?, direction = ?,
+                definition = ?, version = ?, active = ?, updated_at = ? WHERE id = ? AND user_id = ?
+        """, (payload.name.strip(), payload.description, payload.category, payload.symbol, payload.timeframe,
+              payload.direction, json.dumps(definition), version, int(payload.active), now, strategy_id, user_id))
+        _execute(connection, "INSERT INTO strategy_versions (strategy_id, version, definition, created_at) VALUES (?, ?, ?, ?)",
+                 (strategy_id, version, json.dumps(definition), now))
+        updated = _execute(connection, "SELECT * FROM strategies WHERE id = ? AND user_id = ?", (strategy_id, user_id)).fetchone()
+    return _strategy_record(updated)
+
+
+@app.delete("/api/strategies/{strategy_id}", status_code=204)
+def delete_strategy(strategy_id: int, authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        cursor = _execute(connection, "DELETE FROM strategies WHERE id = ? AND user_id = ?", (strategy_id, user_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Strategy not found.")
+    return None
+
+
+@app.get("/api/risk/settings")
+def get_risk_settings(authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        row = _execute(connection, "SELECT settings FROM user_risk_settings WHERE user_id = ?", (user_id,)).fetchone()
+    return json.loads(row["settings"]) if row else {}
+
+
+@app.put("/api/risk/settings")
+def save_risk_settings(payload: RiskSettingsPayload, authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    now = datetime.now(timezone.utc).isoformat()
+    settings = json.dumps(payload.settings)
+    with _auth_connection() as connection:
+        exists = _execute(connection, "SELECT user_id FROM user_risk_settings WHERE user_id = ?", (user_id,)).fetchone()
+        if exists:
+            _execute(connection, "UPDATE user_risk_settings SET settings = ?, updated_at = ? WHERE user_id = ?", (settings, now, user_id))
+        else:
+            _execute(connection, "INSERT INTO user_risk_settings (user_id, settings, updated_at) VALUES (?, ?, ?)", (user_id, settings, now))
+    return payload.settings
+
+
+@app.get("/api/backtests")
+def list_backtests(authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(connection, "SELECT * FROM backtest_runs WHERE user_id = ? ORDER BY created_at DESC LIMIT 100", (user_id,)).fetchall()
+    return [{
+        "id": int(row["id"]),
+        "strategy_id": row["strategy_id"],
+        "strategy_name": row["strategy_name"],
+        "strategy_version": int(row["strategy_version"]),
+        "strategy_snapshot": json.loads(row["strategy_snapshot"]),
+        "result": json.loads(row["result"]),
+        "created_at": row["created_at"],
+    } for row in rows]
 
 
 @app.post("/api/auth/logout", status_code=204)
@@ -354,9 +582,23 @@ def market(
 def signal(
     symbol: str,
     strategy: str = Query("EMA Trend Pullback"),
+    strategy_id: int | None = Query(default=None, ge=1),
     interval: str = Query("5m", pattern="^(1m|2m|5m|15m|30m|60m|90m|1h|1d|5d|1wk|1mo|3mo)$"),
+    authorization: str | None = Header(default=None),
 ):
-    if strategy not in STRATEGIES and strategy not in STRATEGIES.values():
+    strategy_definition = None
+    if strategy_id is not None:
+        user_id = _authenticated_user_id(authorization)
+        with _auth_connection() as connection:
+            saved_strategy = _execute(connection, "SELECT * FROM strategies WHERE id = ? AND user_id = ? AND active = 1", (strategy_id, user_id)).fetchone()
+        if saved_strategy is None:
+            raise HTTPException(status_code=404, detail="Active custom strategy not found.")
+        strategy = saved_strategy["name"]
+        strategy_definition = json.loads(saved_strategy["definition"])
+        if strategy_definition.get("direction", "Long") != "Long":
+            raise HTTPException(status_code=422, detail="Custom signals currently support long-only strategies.")
+        strategy = "custom"
+    if strategy not in STRATEGIES and strategy not in STRATEGIES.values() and strategy != "custom":
         raise HTTPException(status_code=422, detail=f"Unsupported strategy. Choose one of: {', '.join(STRATEGIES)}.")
     df, live = market_frame(symbol, 200, live=True, interval=interval)
     if not live:
@@ -373,12 +615,14 @@ def signal(
             "target_price": None,
             "risk_reward": None,
             "atr_14": None,
-            "strategy": strategy,
+            "strategy": saved_strategy["name"] if strategy_id is not None else strategy,
             "rule": STRATEGIES.get(strategy, strategy),
             "rule_triggered": "No signal generated because live historical data is unavailable.",
             "note": "Synthetic demo candles are for chart display only and are never used to generate signals.",
         }
-    result = generate_signal(df, strategy)
+    result = generate_signal(df, strategy, strategy_definition)
+    if strategy_id is not None:
+        result["strategy"] = saved_strategy["name"]
     return {"symbol": symbol, "timeframe": interval, "live": live, "data_source": "Yahoo Finance chart history" if live else "Synthetic demo data", **result}
 
 @app.get("/api/options/signal/{underlying}")
@@ -398,11 +642,27 @@ def backtest(
     duration: int = Query(5, ge=1, le=3650),
     duration_unit: str = Query("days", pattern="^(days|months|years)$"),
     strategy: str = Query("Price Action Break & Retest"),
+    strategy_id: int | None = Query(default=None, ge=1),
     position_size: float = Query(1000, gt=0),
     stop_loss_pct: float = Query(1.5, ge=0, le=100),
+    take_profit_rr: float | None = Query(default=None, gt=0, le=100),
     fee_bps: float = Query(10, ge=0, le=1000),
+    authorization: str | None = Header(default=None),
 ):
-    if strategy not in STRATEGIES and strategy not in STRATEGIES.values():
+    strategy_definition = None
+    strategy_name = strategy
+    if strategy_id is not None:
+        user_id = _authenticated_user_id(authorization)
+        with _auth_connection() as connection:
+            saved_strategy = _execute(connection, "SELECT * FROM strategies WHERE id = ? AND user_id = ?", (strategy_id, user_id)).fetchone()
+        if saved_strategy is None:
+            raise HTTPException(status_code=404, detail="Custom strategy not found.")
+        strategy_name = saved_strategy["name"]
+        strategy_definition = json.loads(saved_strategy["definition"])
+        if strategy_definition.get("direction", "Long") != "Long":
+            raise HTTPException(status_code=422, detail="Custom backtests currently support long-only strategies.")
+        strategy = "custom"
+    if strategy not in STRATEGIES and strategy not in STRATEGIES.values() and strategy != "custom":
         raise HTTPException(status_code=422, detail=f"Unsupported strategy. Choose one of: {', '.join(STRATEGIES)}.")
     max_duration = _max_duration(timeframe, duration_unit)
     if duration > max_duration:
@@ -422,8 +682,15 @@ def backtest(
     if not in_period.any():
         raise HTTPException(status_code=502, detail="No market data is available for the selected backtest period.")
     start_index = int(in_period.to_numpy().argmax())
-    return {
-        **run_backtest(df, initial_capital, strategy, position_size, stop_loss_pct, fee_bps, start_index),
+    result = {
+        **run_backtest(
+            df, initial_capital, strategy, position_size, stop_loss_pct, fee_bps, start_index,
+            strategy_definition,
+            take_profit_rr if take_profit_rr is not None else (strategy_definition or {}).get("risk_settings", {}).get("target_r"),
+        ),
+        "symbol": symbol,
+        "strategy": strategy_name,
+        "strategy_id": strategy_id,
         "timeframe": timeframe,
         "duration": duration,
         "duration_unit": duration_unit,
@@ -434,6 +701,26 @@ def backtest(
         "period_end": pd.Timestamp(df.time.iloc[-1]).isoformat(),
         "warning": "Yahoo Finance history may be delayed and may be adjusted; this is not exchange-authoritative data. Model excludes taxes, brokerage schedules, lot-size constraints, and market impact.",
     }
+    if authorization:
+        user_id = _authenticated_user_id(authorization)
+        strategy_version = int(saved_strategy["version"]) if strategy_id is not None else 0
+        strategy_snapshot = strategy_definition or {"name": strategy_name, "rule": strategy}
+        created_at = datetime.now(timezone.utc).isoformat()
+        with _auth_connection() as connection:
+            if DATABASE_URL:
+                row = _execute(connection, """
+                    INSERT INTO backtest_runs (user_id, strategy_id, strategy_name, strategy_version, strategy_snapshot, result, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+                """, (user_id, strategy_id, strategy_name, strategy_version, json.dumps(strategy_snapshot), json.dumps(result), created_at)).fetchone()
+                saved_backtest_id = int(row["id"])
+            else:
+                cursor = _execute(connection, """
+                    INSERT INTO backtest_runs (user_id, strategy_id, strategy_name, strategy_version, strategy_snapshot, result, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (user_id, strategy_id, strategy_name, strategy_version, json.dumps(strategy_snapshot), json.dumps(result), created_at))
+                saved_backtest_id = int(cursor.lastrowid)
+        result["saved_backtest_id"] = saved_backtest_id
+    return result
 
 @app.get("/api/risk")
 def risk():

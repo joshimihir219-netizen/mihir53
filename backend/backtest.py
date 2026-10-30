@@ -8,6 +8,19 @@ STRATEGIES = {
     "ICT Liquidity Sweep": "ict_liquidity_sweep",
     "EMA Trend Pullback": "ema_trend_pullback",
     "Donchian Trend Breakout": "donchian_breakout",
+    "VWAP Reversal": "vwap_reversal",
+    "RSI Mean Reversion": "rsi_mean_reversion",
+    "MACD Momentum": "macd_momentum",
+    "ADX Trend Following": "adx_trend_following",
+    "Bollinger Band Breakout": "bollinger_breakout",
+    "Previous Day High/Low Breakout": "previous_day_breakout",
+    "Volume-Based Breakout": "volume_breakout",
+    "Opening Range Breakout": "opening_range_breakout",
+    "Support and Resistance Reversal": "support_resistance_reversal",
+    "Fair Value Gap Retracement": "fvg_retracement",
+    "Order Block Mitigation": "order_block_mitigation",
+    "Supertrend Trend Following": "supertrend_following",
+    "ATR Volatility Breakout": "atr_volatility_breakout",
 }
 
 STRATEGY_DETAILS = {
@@ -83,9 +96,126 @@ STRATEGY_DETAILS = {
     },
 }
 
+for strategy_name, strategy_key in STRATEGIES.items():
+    if strategy_key not in STRATEGY_DETAILS:
+        STRATEGY_DETAILS[strategy_key] = {
+            "name": strategy_name,
+            "style": "Long-only technical setup",
+            "entry_rules": ["Entry conditions are evaluated on completed OHLCV candles."],
+            "exit_rules": ["Exit conditions are evaluated on completed OHLCV candles."],
+            "entry_reason": f"{strategy_name} entry rule triggered on the last completed candle.",
+            "exit_reason": f"{strategy_name} exit rule triggered on the last completed candle.",
+        }
 
-def strategy_mask(df, strategy):
+
+def _custom_value_series(df, definition, cache):
+    if not isinstance(definition, dict):
+        raise ValueError("Each condition value must be an object.")
+    indicator = str(definition.get("indicator", "")).upper()
+    period = definition.get("period", 14)
+    source = str(definition.get("source", "close")).lower()
+    if indicator in {"OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}:
+        return pd.to_numeric(df[indicator.lower()], errors="coerce")
+    if not isinstance(period, int) or not 1 <= period <= 500:
+        raise ValueError("Indicator periods must be whole numbers from 1 to 500.")
+    if source not in {"open", "high", "low", "close", "volume"}:
+        raise ValueError("Indicator source must be an OHLCV field.")
+    cache_key = (indicator, period, source)
+    if cache_key in cache:
+        return cache[cache_key]
+    values = pd.to_numeric(df[source], errors="coerce")
+    if indicator == "EMA":
+        result = values.ewm(span=period, adjust=False, min_periods=period).mean()
+    elif indicator == "SMA":
+        result = values.rolling(period, min_periods=period).mean()
+    elif indicator == "RSI":
+        delta = values.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        result = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+    elif indicator == "ATR":
+        previous_close = pd.to_numeric(df["close"], errors="coerce").shift(1)
+        true_range = pd.concat([
+            pd.to_numeric(df["high"], errors="coerce") - pd.to_numeric(df["low"], errors="coerce"),
+            (pd.to_numeric(df["high"], errors="coerce") - previous_close).abs(),
+            (pd.to_numeric(df["low"], errors="coerce") - previous_close).abs(),
+        ], axis=1).max(axis=1)
+        result = true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    elif indicator == "VOLUME_AVERAGE":
+        result = pd.to_numeric(df["volume"], errors="coerce").rolling(period, min_periods=period).mean()
+    else:
+        raise ValueError(f"Unsupported custom indicator: {indicator or '(empty)'}.")
+    cache[cache_key] = result
+    return result
+
+
+def _evaluate_custom_group(df, group, cache, depth=0):
+    if depth > 8 or not isinstance(group, dict):
+        raise ValueError("Condition groups must be objects nested no more than 8 levels.")
+    logic = str(group.get("logic", "AND")).upper()
+    conditions = group.get("conditions")
+    if logic not in {"AND", "OR", "NOT"} or not isinstance(conditions, list) or not conditions or len(conditions) > 100:
+        raise ValueError("Each condition group needs 1 to 100 conditions and AND, OR, or NOT logic.")
+    if logic == "NOT" and len(conditions) != 1:
+        raise ValueError("NOT groups must contain exactly one condition.")
+    evaluated = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "logic" in condition:
+            evaluated.append(_evaluate_custom_group(df, condition, cache, depth + 1))
+            continue
+        if not isinstance(condition, dict):
+            raise ValueError("Conditions must be objects.")
+        left = _custom_value_series(df, condition.get("left"), cache)
+        right_definition = condition.get("right")
+        if isinstance(right_definition, dict):
+            right = _custom_value_series(df, right_definition, cache)
+        elif isinstance(right_definition, (int, float)) and np.isfinite(right_definition):
+            right = float(right_definition)
+        else:
+            raise ValueError("Condition right-hand values must be finite numbers or indicator definitions.")
+        operator = str(condition.get("operator", ""))
+        if operator == "gt":
+            result = left > right
+        elif operator == "gte":
+            result = left >= right
+        elif operator == "lt":
+            result = left < right
+        elif operator == "lte":
+            result = left <= right
+        elif operator == "crosses_above":
+            result = (left > right) & (left.shift(1) <= (right.shift(1) if isinstance(right, pd.Series) else right))
+        elif operator == "crosses_below":
+            result = (left < right) & (left.shift(1) >= (right.shift(1) if isinstance(right, pd.Series) else right))
+        else:
+            raise ValueError(f"Unsupported condition operator: {operator or '(empty)'}.")
+        evaluated.append(result.fillna(False))
+    if logic == "NOT":
+        return ~evaluated[0]
+    combined = evaluated[0].copy()
+    for result in evaluated[1:]:
+        combined = combined & result if logic == "AND" else combined | result
+    return combined
+
+
+def custom_strategy_mask(df, definition):
+    required = {"open", "high", "low", "close"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing OHLC columns: {', '.join(sorted(missing))}")
+    if not isinstance(definition, dict):
+        raise ValueError("A structured strategy definition is required.")
+    cache = {}
+    entries = _evaluate_custom_group(df, definition.get("entry", {}), cache)
+    exits = _evaluate_custom_group(df, definition.get("exit", {}), cache)
+    return entries.to_numpy(dtype=bool), exits.to_numpy(dtype=bool)
+
+
+def strategy_mask(df, strategy, strategy_definition=None):
     key = STRATEGIES.get(strategy, strategy)
+    if key == "custom":
+        if strategy_definition is None:
+            raise ValueError("A saved custom strategy definition is required.")
+        return custom_strategy_mask(df, strategy_definition)
     if key not in STRATEGY_DETAILS:
         raise ValueError(f"Unknown strategy: {strategy}")
     required = {"open", "high", "low", "close"}
@@ -104,6 +234,12 @@ def strategy_mask(df, strategy):
     previous_close = close.shift(1)
     bullish = close > open_price
     previous_support = low.shift(1).rolling(10, min_periods=10).min()
+    true_range = pd.concat([high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14, min_periods=14).mean()
+    rsi_delta = close.diff()
+    rsi_gain = rsi_delta.clip(lower=0).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rsi_loss = (-rsi_delta.clip(upper=0)).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + rsi_gain / rsi_loss.replace(0, np.nan))
 
     if key == "price_action_retest":
         level = previous_high.shift(1)
@@ -148,10 +284,7 @@ def strategy_mask(df, strategy):
         swept = (low < prior_liquidity) & (close > prior_liquidity)
         swept_recently = swept.shift(1).rolling(4, min_periods=1).sum().fillna(0).gt(0)
         prior_short_high = high.shift(1).rolling(5, min_periods=5).max()
-        true_range = pd.concat(
-            [high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1
-        ).max(axis=1)
-        atr = true_range.rolling(14, min_periods=14).mean()
+        atr = atr14
         bullish_fvg = low > high.shift(2)
         displacement = bullish & ((close - open_price) >= atr * 0.8) & (close > prior_short_high)
         enter = swept_recently & displacement & bullish_fvg
@@ -161,10 +294,142 @@ def strategy_mask(df, strategy):
         touched_ema = low.shift(1).rolling(3, min_periods=3).min() <= ema20.shift(1) * 1.003
         enter = uptrend & touched_ema & (close > ema20) & bullish
         exit_ = (close < ema20) | (ema20 < ema50)
-    else:
+    elif key == "donchian_breakout":
         crossed_resistance = (close > previous_high) & (previous_close <= previous_high.shift(1))
         enter = crossed_resistance & (ema20 > ema50)
         exit_ = (close < previous_support) | (ema20 < ema50)
+    elif key == "vwap_reversal":
+        typical = (high + low + close) / 3
+        volume = pd.to_numeric(df.get("volume", pd.Series(1, index=df.index)), errors="coerce").fillna(0)
+        if "time" in df:
+            sessions = pd.to_datetime(df["time"]).dt.date
+            cumulative_volume = volume.groupby(sessions).cumsum().replace(0, np.nan)
+            vwap = (typical * volume).groupby(sessions).cumsum() / cumulative_volume
+        else:
+            vwap = (typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
+        deviation = (close - vwap).rolling(20, min_periods=10).std()
+        enter = (close < vwap - deviation) & (close > previous_close) & bullish
+        exit_ = close >= vwap
+    elif key == "rsi_mean_reversion":
+        enter = (rsi < 30) & (rsi > rsi.shift(1)) & bullish
+        exit_ = (rsi > 60) | (close > close.rolling(20, min_periods=20).mean())
+    elif key == "macd_momentum":
+        macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        signal_line = macd.ewm(span=9, adjust=False).mean()
+        enter = (macd > signal_line) & (macd.shift(1) <= signal_line.shift(1)) & (macd > 0)
+        exit_ = (macd < signal_line) & (macd.shift(1) >= signal_line.shift(1))
+    elif key == "adx_trend_following":
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        smoothed_tr = true_range.rolling(14, min_periods=14).mean()
+        plus_di = 100 * plus_dm.rolling(14, min_periods=14).mean() / smoothed_tr.replace(0, np.nan)
+        minus_di = 100 * minus_dm.rolling(14, min_periods=14).mean() / smoothed_tr.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.rolling(14, min_periods=14).mean()
+        enter = (adx > 25) & (plus_di > minus_di) & (close > ema20) & (plus_di.shift(1) <= minus_di.shift(1))
+        exit_ = (plus_di < minus_di) | (adx < 18)
+    elif key == "bollinger_breakout":
+        middle = close.rolling(20, min_periods=20).mean()
+        width = close.rolling(20, min_periods=20).std(ddof=0) * 2
+        upper = middle + width
+        enter = (close > upper) & (previous_close <= upper.shift(1))
+        exit_ = (close < middle) | (close < previous_support)
+    elif key in {"previous_day_breakout", "opening_range_breakout"}:
+        times = pd.to_datetime(df["time"], errors="coerce") if "time" in df else None
+        if times is None:
+            enter = pd.Series(False, index=df.index)
+            exit_ = close < ema20
+        elif key == "previous_day_breakout":
+            session = times.dt.date
+            daily = df.assign(_session=session).groupby("_session").agg(day_high=("high", "max"), day_low=("low", "min"))
+            prior_day_high = session.map(daily["day_high"].shift(1))
+            prior_day_low = session.map(daily["day_low"].shift(1))
+            enter = (close > prior_day_high) & (previous_close <= prior_day_high.shift(1))
+            exit_ = (close < prior_day_low) | (close < ema20)
+        else:
+            session = times.dt.date
+            session_start = times.groupby(session).transform("min")
+            opening = times < session_start + pd.Timedelta(minutes=30)
+            opening_high = high.where(opening).groupby(session).transform("max")
+            opening_low = low.where(opening).groupby(session).transform("min")
+            after_opening = ~opening
+            enter = after_opening & (close > opening_high) & (previous_close <= opening_high.shift(1))
+            exit_ = (close < opening_low) | (close < ema20)
+    elif key == "volume_breakout":
+        volume = pd.to_numeric(df.get("volume", pd.Series(np.nan, index=df.index)), errors="coerce")
+        average_volume = volume.shift(1).rolling(20, min_periods=20).mean()
+        crossed_resistance = (close > previous_high) & (previous_close <= previous_high.shift(1))
+        enter = crossed_resistance & (volume > average_volume * 1.5)
+        exit_ = (close < previous_support) | (volume < average_volume * 0.5)
+    elif key == "support_resistance_reversal":
+        support = low.shift(1).rolling(20, min_periods=20).min()
+        enter = (low <= support * 1.002) & (close > support) & bullish
+        exit_ = (close < support.shift(1)) | (close < ema20)
+    elif key in {"fvg_retracement", "order_block_mitigation"}:
+        entries = np.zeros(len(df), dtype=bool)
+        pending_zone = None
+        setup_index = -1
+        if key == "fvg_retracement":
+            setup = low > high.shift(2)
+            for index in range(len(df)):
+                if pending_zone is not None:
+                    zone_low, zone_top = pending_zone
+                    if index - setup_index > 10 or close.iloc[index] < zone_low:
+                        pending_zone = None
+                    elif index > setup_index and low.iloc[index] <= zone_top and close.iloc[index] > (zone_low + zone_top) / 2 and bullish.iloc[index]:
+                        entries[index] = True
+                        pending_zone = None
+                if pending_zone is None and setup.iloc[index]:
+                    pending_zone = (high.iloc[index - 2], low.iloc[index])
+                    setup_index = index
+        else:
+            structure_break = (close > high.shift(1).rolling(10, min_periods=10).max()) & (previous_close <= high.shift(1).rolling(10, min_periods=10).max().shift(1)) & (close - open_price >= atr14 * 0.8)
+            for index in range(len(df)):
+                if pending_zone is not None:
+                    zone_low, zone_top = pending_zone
+                    if index - setup_index > 10 or close.iloc[index] < zone_low:
+                        pending_zone = None
+                    elif index > setup_index and low.iloc[index] <= zone_top and close.iloc[index] > (zone_low + zone_top) / 2 and bullish.iloc[index]:
+                        entries[index] = True
+                        pending_zone = None
+                if pending_zone is None and structure_break.iloc[index]:
+                    candidates = [candidate for candidate in range(max(0, index - 5), index) if close.iloc[candidate] < open_price.iloc[candidate]]
+                    if candidates:
+                        block_index = candidates[-1]
+                        pending_zone = (low.iloc[block_index], open_price.iloc[block_index])
+                        setup_index = index
+        enter = pd.Series(entries, index=df.index)
+        exit_ = (close < previous_support) | (close < ema20)
+    elif key == "supertrend_following":
+        midpoint = (high + low) / 2
+        basic_upper = midpoint + 3 * atr14
+        basic_lower = midpoint - 3 * atr14
+        upper = basic_upper.to_numpy(dtype=float, copy=True)
+        lower = basic_lower.to_numpy(dtype=float, copy=True)
+        trend = np.zeros(len(df), dtype=bool)
+        close_values = pd.to_numeric(close, errors="coerce").to_numpy(dtype=float)
+        for index in range(1, len(df)):
+            if not np.isfinite(upper[index - 1]) or not np.isfinite(lower[index - 1]):
+                upper[index] = basic_upper.iloc[index]
+                lower[index] = basic_lower.iloc[index]
+                continue
+            upper[index] = basic_upper.iloc[index] if basic_upper.iloc[index] < upper[index - 1] or close_values[index - 1] > upper[index - 1] else upper[index - 1]
+            lower[index] = basic_lower.iloc[index] if basic_lower.iloc[index] > lower[index - 1] or close_values[index - 1] < lower[index - 1] else lower[index - 1]
+            if trend[index - 1] and close_values[index] >= lower[index]:
+                trend[index] = True
+            elif not trend[index - 1] and close_values[index] > upper[index - 1]:
+                trend[index] = True
+        trend = pd.Series(trend, index=df.index)
+        prior_trend = trend.shift(1).fillna(False).astype(bool)
+        enter = trend & ~prior_trend
+        exit_ = ~trend & prior_trend
+    else:
+        volatility_floor = (atr14 / close).rolling(50, min_periods=25).median()
+        breakout_level = previous_high + atr14 * 0.1
+        enter = (close > breakout_level) & (previous_close <= breakout_level.shift(1)) & ((atr14 / close) > volatility_floor)
+        exit_ = (close < previous_support) | (close < ema20)
 
     entries = enter.fillna(False).to_numpy(dtype=bool, copy=True)
     exits = exit_.fillna(False).to_numpy(dtype=bool, copy=True)
@@ -174,11 +439,14 @@ def strategy_mask(df, strategy):
     return entries, exits
 
 
-def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Retest", position_size=1000, stop_loss_pct=1.5, fee_bps=10, start_index=0):
+def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Retest", position_size=1000, stop_loss_pct=1.5, fee_bps=10, start_index=0, strategy_definition=None, take_profit_rr=None):
     initial_capital = float(initial_capital)
     position_size = float(position_size)
     stop_loss_pct = max(0.0, float(stop_loss_pct))
     fee_bps = max(0.0, float(fee_bps))
+    take_profit_rr = None if take_profit_rr is None else float(take_profit_rr)
+    if take_profit_rr is not None and (not np.isfinite(take_profit_rr) or not 0 < take_profit_rr <= 100):
+        raise ValueError("Take-profit risk multiple must be greater than 0 and at most 100.")
     if initial_capital <= 0 or position_size <= 0:
         raise ValueError("Initial capital and position budget must be greater than zero.")
     if df.empty:
@@ -196,7 +464,7 @@ def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Rete
     closed_pnls = []
     equity = []
     trade_log = []
-    entries, exits = strategy_mask(df, strategy)
+    entries, exits = strategy_mask(df, strategy, strategy_definition)
     fee_rate = fee_bps / 10000
 
     def close_position(row, fill_price, reason):
@@ -223,6 +491,7 @@ def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Rete
         if i < start_index:
             continue
         open_price = float(row.open)
+        high = float(row.high)
         close_price = float(row.close)
         low = float(row.low)
         signal_index = i - 1
@@ -238,6 +507,12 @@ def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Rete
         if shares and signal_index >= 0 and exits[signal_index]:
             close_position(row, open_price, "strategy_exit_next_open")
             exited_this_bar = True
+
+        if shares and not exited_this_bar and take_profit_rr and stop_loss_pct:
+            target_price = entry_price * (1 + stop_loss_pct / 100 * take_profit_rr)
+            if high >= target_price:
+                close_position(row, max(open_price, target_price), "take_profit")
+                exited_this_bar = True
 
         if not shares and not exited_this_bar and signal_index >= 0 and entries[signal_index]:
             budget = min(cash, position_size)
@@ -260,6 +535,13 @@ def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Rete
             if low <= stop_price:
                 stop_fill = min(open_price, stop_price)
                 close_position(row, stop_fill, "stop_loss")
+                exited_this_bar = True
+
+        if shares and not exited_this_bar and take_profit_rr and stop_loss_pct:
+            target_price = entry_price * (1 + stop_loss_pct / 100 * take_profit_rr)
+            if high >= target_price:
+                close_position(row, max(open_price, target_price), "take_profit")
+                exited_this_bar = True
 
         equity.append(cash + shares * close_price)
 
@@ -299,6 +581,7 @@ def run_backtest(df, initial_capital=100000, strategy="Price Action Break & Rete
         "strategy": strategy,
         "position_size": position_size,
         "stop_loss_pct": stop_loss_pct,
+        "take_profit_rr": take_profit_rr,
         "fee_bps": fee_bps,
         "execution_model": "Signals use completed bars and execute at the next bar open; stop gaps fill at the worse observed open.",
     }

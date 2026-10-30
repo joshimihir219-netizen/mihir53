@@ -3,14 +3,14 @@ import pandas as pd
 from backtest import STRATEGIES, STRATEGY_DETAILS, strategy_mask
 
 
-def generate_signal(df, strategy="EMA Trend Pullback"):
+def generate_signal(df, strategy="EMA Trend Pullback", strategy_definition=None):
     if df.empty:
         raise ValueError("Signal generation requires at least one candle.")
 
     latest = df.iloc[-1]
     close = float(latest["close"])
     rule = STRATEGIES.get(strategy, strategy)
-    entries, exits = strategy_mask(df, rule)
+    entries, exits = strategy_mask(df, rule, strategy_definition)
     signal = "BUY" if entries[-1] else "SELL" if exits[-1] else "HOLD"
     true_range = pd.concat(
         [
@@ -28,7 +28,10 @@ def generate_signal(df, strategy="EMA Trend Pullback"):
         risk = max(float(atr) * 1.5, close * 0.0025)
         stop_loss = round(close - risk, 4)
         target_price = round(close + risk * 2, 4)
-    details = STRATEGY_DETAILS[rule]
+    details = STRATEGY_DETAILS.get(rule, {
+        "entry_reason": "The saved custom entry conditions evaluated true on the latest completed candle.",
+        "exit_reason": "The saved custom exit conditions evaluated true on the latest completed candle.",
+    })
 
     return {
         "signal": signal,
