@@ -3,7 +3,7 @@ import "./signal-details.css";
 import "./strategy-lab.css";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
-import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingUp, TrendingDown, LogIn} from "lucide-react";
+import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn} from "lucide-react";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler);
 
@@ -17,10 +17,11 @@ function maxDurationForUnit(timeframe, unit){
   const divisor = unit === "years" ? 365 : unit === "months" ? 30 : 1;
   return Math.floor(TIMEFRAME_MAX_DURATION_DAYS[timeframe] / divisor);
 }
-const nav = [
-  ["Dashboard", LayoutDashboard], ["Signals", Activity], ["Options Trading", TrendingUp], ["Backtesting", FlaskConical],
-  ["Risk Management", ShieldCheck], ["Reports", FileText], ["Strategies", Settings]
+const workspaceNav = [["Dashboard", LayoutDashboard], ["Signals", Activity]];
+const analysisNav = [
+  ["Backtesting", FlaskConical], ["Risk Management", ShieldCheck], ["Reports", FileText], ["Strategies", Settings]
 ];
+const nav = [...workspaceNav, ...analysisNav];
 const defaultStrategies = [
   {name: "Price Action Break & Retest", rule: "price_action_retest", risk: "Medium", status: "READY", description: "Prior 20-bar resistance breaks; the next bar retests the level and closes bullish above it. Exit below prior 10-bar support or EMA 20.", entryRules: ["Close above the highest high of the prior 20 completed bars.", "The following bar touches within 0.3% of the broken level and closes bullish above it."], exitRules: ["Close below the prior 10-bar low.", "Or close below EMA 20."]},
   {name: "Smart Money Structure (SMC)", rule: "smc_order_block_retest", risk: "High", status: "READY", description: "A 20-bar structure break is followed by a retest of the last bearish candle's range within 10 bars. Exit below prior 10-bar support or EMA 20.", entryRules: ["Close above the prior 20-bar structure high.", "Within 10 bars, retest the last bearish candle range from the 5 bars before the break and close bullish above its midpoint."], exitRules: ["Setup expires after 10 bars or a close below the order-block low before entry.", "After entry, close below prior 10-bar support or EMA 20."]},
@@ -52,55 +53,8 @@ function formatPercent(value){
   return `${clean >= 0 ? "+" : ""}${clean.toFixed(2)}%`;
 }
 
-function normalCdf(value){
-  const absolute = Math.abs(value);
-  const t = 1 / (1 + 0.2316419 * absolute);
-  const density = 0.3989422804 * Math.exp(-0.5 * absolute * absolute);
-  const probability = 1 - density * t * (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
-  return value >= 0 ? probability : 1 - probability;
-}
-
-function estimateOptionPremium(spot, strike, daysToExpiry, optionType, volatility = 0.2){
-  if (!spot || !strike || daysToExpiry <= 0) return 0;
-  const time = daysToExpiry / 365;
-  const rootTime = Math.sqrt(time);
-  const d1 = (Math.log(spot / strike) + 0.5 * volatility * volatility * time) / (volatility * rootTime);
-  const d2 = d1 - volatility * rootTime;
-  const premium = optionType === "CALL"
-    ? spot * normalCdf(d1) - strike * normalCdf(d2)
-    : strike * normalCdf(-d2) - spot * normalCdf(-d1);
-  return Math.max(0.05, Number(premium.toFixed(2)));
-}
-
-function nextOptionsExpiry(daysFromToday){
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  date.setDate(date.getDate() + daysFromToday);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
 function formatTradeDate(date = new Date()){
   return date.toLocaleDateString("en-IN", {day: "numeric", month: "short", year: "numeric"});
-}
-
-function createOptionsSignalMetadata(key){
-  const generatedAt = new Date();
-  const dateParts = [
-    generatedAt.getFullYear(),
-    String(generatedAt.getMonth() + 1).padStart(2, "0"),
-    String(generatedAt.getDate()).padStart(2, "0")
-  ];
-  const timeParts = [
-    String(generatedAt.getHours()).padStart(2, "0"),
-    String(generatedAt.getMinutes()).padStart(2, "0"),
-    String(generatedAt.getSeconds()).padStart(2, "0"),
-    String(generatedAt.getMilliseconds()).padStart(3, "0")
-  ];
-  return {
-    key,
-    date: formatTradeDate(generatedAt),
-    tradeNumber: `OPT-${dateParts.join("")}-${timeParts.join("")}`
-  };
 }
 
 function formatMarketPrice(symbol, value){
@@ -839,7 +793,9 @@ function App(){
           <span className="profileEditHint">Edit</span>
         </button>
         <div className="sectionLabel">WORKSPACE</div>
-        {nav.map(([name, Icon]) => <button key={name} className={page === name ? "nav active" : "nav"} onClick={() => setPage(name)}><Icon size={18} />{name}</button>)}
+        {workspaceNav.map(([name, Icon]) => <button key={name} className={page === name ? "nav active" : "nav"} onClick={() => setPage(name)}><Icon size={18} />{name}</button>)}
+        <div className="sectionLabel analysisSectionLabel">ANALYSIS</div>
+        {analysisNav.map(([name, Icon]) => <button key={name} className={page === name ? "nav active" : "nav"} onClick={() => setPage(name)}><Icon size={18} />{name}</button>)}
         <div className="sidebarBottom">
           <div className="riskMini"><span>●</span> System online<small>Market data connected</small></div>
           <div className="supportContact">
@@ -931,8 +887,7 @@ function App(){
         </header>
         <div className="content">
           {page === "Dashboard" && <Dashboard markets={markets} symbol={symbol} setSymbol={setSymbol} market={market} signal={signal} chartInterval={chartInterval} setChartInterval={setChartInterval} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} onViewAll={() => setPage("Signals")} notifyTelegram={notifyTelegram} addLog={addLog} />}
-          {page === "Signals" && <Signals symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} chartInterval={chartInterval} setChartInterval={setChartInterval} strategies={strategies} selectedStrategy={selectedStrategy} setSelectedStrategy={setSelectedStrategy} riskRules={riskRules} notifyTelegram={notifyTelegram} addLog={addLog} />}
-          {page === "Options Trading" && <OptionsTrading symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} addLog={addLog} />}
+          {page === "Signals" && <Signals symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} chartInterval={chartInterval} setChartInterval={setChartInterval} strategies={strategies} selectedStrategy={selectedStrategy} setSelectedStrategy={setSelectedStrategy} riskRules={riskRules} isLoggedIn={isLoggedIn} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Backtesting" && <Backtesting backtest={backtest} backtestError={backtestError} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} symbol={symbol} backtestForm={backtestForm} setBacktestForm={setBacktestForm} strategies={strategies} savedBacktests={savedBacktests} onLoadSavedBacktest={(run) => { setBacktest(run.result); setBacktestForm((current) => ({...current, symbol: run.result.symbol || current.symbol, strategy: run.strategy_name, timeframe: run.result.timeframe || current.timeframe, durationValue: String(run.result.duration || current.durationValue), durationUnit: run.result.duration_unit || current.durationUnit, initialCapital: String(run.result.initial_capital || current.initialCapital), positionSize: String(run.result.position_size || current.positionSize), stopLoss: String(run.result.stop_loss_pct || current.stopLoss), takeProfitRR: String(run.result.take_profit_rr || current.takeProfitRR)})); }} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Risk Management" && <Risk riskRules={riskRules} setRiskRules={setRiskRules} saveRiskRules={saveRiskRules} addLog={addLog} isLoggedIn={isLoggedIn} />}
           {page === "Reports" && <Reports backtest={backtest} exportReport={exportReport} exportMessage={exportMessage} notifyTelegram={notifyTelegram} />}
@@ -1554,7 +1509,7 @@ function OptionSignalNotification({details, expanded = false}){
   );
 }
 
-function Signals({symbol, setSymbol, signal, markets, market, chartInterval, setChartInterval, strategies, selectedStrategy, setSelectedStrategy, riskRules, notifyTelegram, addLog}){
+function Signals({symbol, setSymbol, signal, markets, market, chartInterval, setChartInterval, strategies, selectedStrategy, setSelectedStrategy, riskRules, isLoggedIn, notifyTelegram, addLog}){
   const entry = Number(signal?.entry_price);
   const stop = Number(signal?.stop_loss);
   const target = Number(signal?.target_price);
@@ -1608,296 +1563,91 @@ function Signals({symbol, setSymbol, signal, markets, market, chartInterval, set
           notifyTelegram(message);
         }}>Send to Telegram</button></div>
       </div>
+      <OptionsAnalysis symbol={symbol} isLoggedIn={isLoggedIn} addLog={addLog} />
     </>
   );
 }
 
-function OptionsTrading({symbol, setSymbol, signal, markets, market, addLog}){
-  const underlyings = ["NIFTY 50", "BANK NIFTY", "SENSEX"];
-  const [expiry, setExpiry] = useState(() => nextOptionsExpiry(7));
-  const [optionType, setOptionType] = useState("CALL");
-  const [strike, setStrike] = useState(null);
+function OptionsAnalysis({symbol, isLoggedIn, addLog}){
+  const supportedUnderlyings = ["NIFTY 50", "BANK NIFTY", "SENSEX"];
   const [tradeType, setTradeType] = useState("INTRADAY");
-  const [liveOptionSignal, setLiveOptionSignal] = useState(null);
-  const [liveOptionError, setLiveOptionError] = useState("");
-  const [liveOptionLoading, setLiveOptionLoading] = useState(true);
-  const notifiedOptionSignalsRef = useRef(null);
-  if (notifiedOptionSignalsRef.current === null) {
-    try {
-      const savedKeys = JSON.parse(localStorage.getItem("trademind-option-signal-notifications") || "[]");
-      notifiedOptionSignalsRef.current = new Set(Array.isArray(savedKeys) ? savedKeys : []);
-    } catch {
-      notifiedOptionSignalsRef.current = new Set();
-    }
-  }
-  const [side, setSide] = useState("BUY");
-  const [quantity, setQuantity] = useState("1");
-  const [orderError, setOrderError] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [paperOrders, setPaperOrders] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem("trademind-paper-options") || "[]");
-      return Array.isArray(saved) ? saved : [];
-    } catch { return []; }
-  });
-  const underlying = underlyings.includes(symbol) ? symbol : "NIFTY 50";
-  const selectedMarket = symbol === underlying ? market : (markets || []).find((item) => item.symbol === underlying);
-  const spot = Number(selectedMarket?.price || 0);
-  const strikeStep = underlying === "NIFTY 50" ? 50 : 100;
-  const atmStrike = spot ? Math.round(spot / strikeStep) * strikeStep : strikeStep;
-  const strikes = Array.from({length: 11}, (_, index) => atmStrike + (index - 5) * strikeStep);
-  const selectedStrike = strikes.includes(Number(strike)) ? Number(strike) : atmStrike;
-  const expiryDate = new Date(`${expiry}T00:00:00`);
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const daysToExpiry = Math.max(1, Math.ceil((expiryDate.getTime() - today.getTime()) / 86400000));
-  const selectedPremium = estimateOptionPremium(spot, selectedStrike, daysToExpiry, optionType);
-  const signalKey = [underlying, tradeType, liveOptionSignal?.signal, liveOptionSignal?.contract].join("|");
-  const [signalMetadata, setSignalMetadata] = useState(() => createOptionsSignalMetadata(signalKey));
+  const [optionSignal, setOptionSignal] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const notifiedKeysRef = useRef(new Set());
 
   useEffect(() => {
+    if (!supportedUnderlyings.includes(symbol)) {
+      setOptionSignal(null);
+      setError("");
+      return undefined;
+    }
     let cancelled = false;
-    async function loadLiveSignal(){
-      setLiveOptionLoading(true);
-      setLiveOptionError("");
+    async function loadAnalysis(){
+      setLoading(true);
+      setError("");
       try {
         const savedSession = JSON.parse(localStorage.getItem("trademind-auth-session") || "null");
-        if (!savedSession?.accessToken) throw new Error("Sign in to request a live Angel One options signal.");
+        if (!savedSession?.accessToken) throw new Error("Sign in to load live option contract analysis.");
         const params = new URLSearchParams({trade_type: tradeType});
-        const response = await fetch(`${API}/options/signal/${encodeURIComponent(underlying)}?${params}`, {
+        const response = await fetch(`${API}/options/signal/${encodeURIComponent(symbol)}?${params}`, {
           headers: {Authorization: `Bearer ${savedSession.accessToken}`}
         });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.detail || "Unable to load a live options signal.");
-        if (!cancelled) setLiveOptionSignal(result);
-      } catch (error) {
-        if (!cancelled) setLiveOptionError(error.message || "Unable to load a live options signal.");
+        if (!response.ok) throw new Error(result.detail || "Unable to load option analysis.");
+        if (!cancelled) setOptionSignal(result);
+      } catch (fetchError) {
+        if (!cancelled) setError(fetchError.message || "Unable to load option analysis.");
       } finally {
-        if (!cancelled) setLiveOptionLoading(false);
+        if (!cancelled) setLoading(false);
       }
     }
-    loadLiveSignal();
-    const timer = setInterval(loadLiveSignal, 15000);
+    loadAnalysis();
+    const timer = setInterval(loadAnalysis, 15000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [underlying, tradeType]);
+  }, [symbol, tradeType, isLoggedIn]);
 
   useEffect(() => {
-    if (symbol !== underlying) setSymbol(underlying);
-  }, [symbol, underlying, setSymbol]);
-
-  useEffect(() => {
-    setSignalMetadata((current) => current.key === signalKey ? current : createOptionsSignalMetadata(signalKey));
-  }, [signalKey]);
-
-  useEffect(() => {
-    if (
-      !liveOptionSignal?.contract ||
-      !["BUY", "SELL"].includes(liveOptionSignal.signal) ||
-      !Number.isFinite(Number(liveOptionSignal.entry_premium)) ||
-      !Number.isFinite(Number(liveOptionSignal.target_premium)) ||
-      !Number.isFinite(Number(liveOptionSignal.stop_loss_premium))
-    ) return;
-
+    if (!optionSignal?.contract || !["BUY", "SELL"].includes(optionSignal.signal)) return;
     const details = {
-      underlying: liveOptionSignal.underlying,
-      signal: liveOptionSignal.signal,
-      contract: liveOptionSignal.contract,
-      expiry: liveOptionSignal.expiry,
-      tradeType: liveOptionSignal.trade_type,
-      optionType: liveOptionSignal.option_type,
-      action: liveOptionSignal.action,
-      signalDate: liveOptionSignal.signal_date,
-      entry: Number(liveOptionSignal.entry_premium),
-      target: Number(liveOptionSignal.target_premium),
-      stopLoss: Number(liveOptionSignal.stop_loss_premium)
+      underlying: optionSignal.underlying,
+      signal: optionSignal.signal,
+      contract: optionSignal.contract,
+      expiry: optionSignal.expiry,
+      tradeType: optionSignal.trade_type,
+      optionType: optionSignal.option_type,
+      action: optionSignal.action,
+      signalDate: optionSignal.signal_date,
+      entry: Number(optionSignal.entry_premium),
+      target: Number(optionSignal.target_premium),
+      stopLoss: Number(optionSignal.stop_loss_premium)
     };
-    const notificationKey = [
-      details.underlying,
-      details.signalDate,
-      details.tradeType,
-      details.contract,
-      details.action
-    ].join("|");
-    if (notifiedOptionSignalsRef.current.has(notificationKey)) return;
-
-    notifiedOptionSignalsRef.current.add(notificationKey);
+    const notificationKey = [details.underlying, details.signalDate, details.tradeType, details.contract, details.action].join("|");
+    if (notifiedKeysRef.current.has(notificationKey)) return;
+    notifiedKeysRef.current.add(notificationKey);
     try {
-      localStorage.setItem(
-        "trademind-option-signal-notifications",
-        JSON.stringify([...notifiedOptionSignalsRef.current].slice(-100))
-      );
+      const saved = JSON.parse(localStorage.getItem("trademind-option-signal-notifications") || "[]");
+      const keys = new Set(Array.isArray(saved) ? saved : []);
+      if (keys.has(notificationKey)) return;
+      keys.add(notificationKey);
+      localStorage.setItem("trademind-option-signal-notifications", JSON.stringify([...keys].slice(-100)));
     } catch {}
-    const message = `${details.contract} · ${details.tradeType} · ${details.signalDate} · Expiry ${details.expiry} · Entry ${toCurrency(details.entry)} · Target ${toCurrency(details.target)} · SL ${toCurrency(details.stopLoss)}`;
-    addLog(message, "signal", details);
-  }, [liveOptionSignal, addLog]);
+    addLog(`${details.contract} · ${details.tradeType} · ${details.signalDate} · Expiry ${details.expiry} · Entry ${toCurrency(details.entry)} · Target ${toCurrency(details.target)} · SL ${toCurrency(details.stopLoss)}`, "signal", details);
+  }, [optionSignal, addLog]);
 
-  useEffect(() => {
-    try { localStorage.setItem("trademind-paper-options", JSON.stringify(paperOrders.slice(0, 10))); } catch {}
-  }, [paperOrders]);
-
-  async function submitPaperOrder(event){
-    event.preventDefault();
-    setOrderError("");
-    const units = Number(quantity);
-    if (!Number.isInteger(units) || units < 1 || !selectedPremium) {
-      setOrderError("Enter a positive whole-number quantity and wait for a valid underlying price.");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const params = new URLSearchParams({
-        symbol: underlying,
-        side,
-        quantity: String(units),
-        price: selectedPremium.toFixed(2),
-        option_type: optionType,
-        strike: String(selectedStrike),
-        expiry
-      });
-      const response = await fetch(`${API}/orders/paper?${params}`, {method: "POST"});
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "Paper order was rejected.");
-      const order = {...result, id: `${Date.now()}-${selectedStrike}`, created_at: new Date().toLocaleString()};
-      setPaperOrders((current) => [order, ...current].slice(0, 10));
-      addLog(`${side} ${units} ${underlying} ${selectedStrike} ${optionType} paper option accepted at ${toCurrency(selectedPremium)}.`, "info");
-    } catch (error) {
-      setOrderError(error.message || "Unable to submit the paper order.");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
+  if (!supportedUnderlyings.includes(symbol)) return null;
   return (
-    <>
-      <div className="pageHead">
-        <div><p className="eyebrow">LIVE SIGNAL · PAPER ORDERS</p><h1>Options Trading</h1><p>Live Angel One listed contracts and premiums; the paper-order simulator remains separate.</p></div>
-        <span className="optionDemoBadge">SIGNALS FROM ANGEL ONE · NO LIVE EXECUTION</span>
-      </div>
-      <div className="optionWorkspace">
-        <section className="panel optionChainPanel">
-          <div className="panelHead"><div><h3>Indicative options chain</h3><p className="optionSubheading">Separate simulator only; these estimates are not used in the live signal.</p></div></div>
-          <div className="optionControls">
-            <label>Underlying
-              <select value={underlying} onChange={(event) => { setSymbol(event.target.value); setStrike(null); }}>
-                {underlyings.map((item) => <option key={item} value={item}>{item}</option>)}
-              </select>
-            </label>
-            <label>Simulated expiry
-              <select value={expiry} onChange={(event) => setExpiry(event.target.value)}>
-                {[7, 14, 30].map((days) => {
-                  const date = nextOptionsExpiry(days);
-                  return <option key={days} value={date}>{date} · {days}-day scenario</option>;
-                })}
-              </select>
-            </label>
-            <label>Option right
-              <select value={optionType} onChange={(event) => setOptionType(event.target.value)}>
-                <option value="CALL">Call</option><option value="PUT">Put</option>
-              </select>
-            </label>
-          </div>
-          <div className="optionUnderlyingStats">
-            <span>Underlying spot <b>{toCurrency(spot)}</b></span>
-            <span>Strike step <b>{toCurrency(strikeStep)}</b></span>
-            <span>Pricing basis <b>20% assumed volatility</b></span>
-          </div>
-          <div className="optionChainScroll">
-            <table className="optionChainTable">
-              <thead><tr><th>Call premium</th><th>Call</th><th>Strike</th><th>Put</th><th>Put premium</th></tr></thead>
-              <tbody>
-                {strikes.map((rowStrike) => {
-                  const call = estimateOptionPremium(spot, rowStrike, daysToExpiry, "CALL");
-                  const put = estimateOptionPremium(spot, rowStrike, daysToExpiry, "PUT");
-                  const active = selectedStrike === rowStrike;
-                  return (
-                    <tr className={active ? "selectedStrike" : ""} key={rowStrike}>
-                      <td>{toCurrency(call)}</td>
-                      <td><button type="button" className={`optionSelectButton ${optionType === "CALL" && active ? "active" : ""}`} onClick={() => { setStrike(rowStrike); setOptionType("CALL"); }}>Select</button></td>
-                      <th scope="row">{rowStrike.toLocaleString("en-IN")}{rowStrike === atmStrike && <small> ATM</small>}</th>
-                      <td><button type="button" className={`optionSelectButton ${optionType === "PUT" && active ? "active" : ""}`} onClick={() => { setStrike(rowStrike); setOptionType("PUT"); }}>Select</button></td>
-                      <td>{toCurrency(put)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
-        <aside className="panel optionTradePanel">
-          <div className="panelHead"><div><h3>Paper trade</h3><p className="optionSubheading">No broker connection or real order placement.</p></div></div>
-          <div className="optionContractSummary">
-            <span>{underlying} · {selectedStrike} · {optionType}</span>
-            <strong>{toCurrency(selectedPremium)}</strong>
-            <small>Simulated premium · {expiry}</small>
-          </div>
-          <form className="optionTradeForm" onSubmit={submitPaperOrder}>
-            <label>Action
-              <select value={side} onChange={(event) => setSide(event.target.value)}>
-                <option value="BUY">Buy</option><option value="SELL">Sell</option>
-              </select>
-            </label>
-            <label>Quantity (units)
-              <input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(event.target.value)} required />
-            </label>
-            <button className="primary" type="submit" disabled={submitting || !spot}>{submitting ? "Submitting…" : "Submit paper order"}</button>
-          </form>
-          {orderError && <p className="optionError" role="alert">{orderError}</p>}
-          <div className="optionSignal">
-            <p className="eyebrow">LIVE OPTIONS SIGNAL · {liveOptionSignal?.signal || "WAIT"} · {tradeType}</p>
-            <div className="optionSignalMeta">
-              <span>Signal date <b>{liveOptionSignal?.signal_date || signalMetadata.date}</b></span>
-              <span>Trade No. <b>{signalMetadata.tradeNumber}</b></span>
-              {liveOptionSignal?.confidence !== undefined && <span>Confidence <b>{liveOptionSignal.confidence}%</b></span>}
-            </div>
-            <div className="optionSignalControls">
-              <label>Trade type
-                <select value={tradeType} onChange={(event) => setTradeType(event.target.value)}>
-                  <option value="INTRADAY">Intraday</option>
-                  <option value="BTST">BTST · Buy today, sell tomorrow</option>
-                  <option value="STBT">STBT · Sell today, buy tomorrow</option>
-                </select>
-              </label>
-            </div>
-            {liveOptionError ? (
-              <p className="optionError" role="alert">{liveOptionError}</p>
-            ) : liveOptionLoading && !liveOptionSignal ? (
-              <p>Connecting to Angel One SmartAPI for live contract and quote data…</p>
-            ) : liveOptionSignal?.contract ? (
-              <dl className="optionSignalDetails">
-                <div><dt>Signal</dt><dd>{liveOptionSignal.signal} · {liveOptionSignal.underlying}</dd></div>
-                <div><dt>Exact option contract</dt><dd>{liveOptionSignal.contract}</dd></div>
-                <div><dt>Expiry</dt><dd>{liveOptionSignal.expiry}</dd></div>
-                <div><dt>Trade type / action</dt><dd>{liveOptionSignal.trade_type} · {liveOptionSignal.action} {liveOptionSignal.option_type}</dd></div>
-                <div><dt>Live entry premium</dt><dd>{toCurrency(liveOptionSignal.entry_premium)}</dd></div>
-                <div><dt>Target premium</dt><dd>{toCurrency(liveOptionSignal.target_premium)}</dd></div>
-                <div><dt>Stop-loss premium</dt><dd>{toCurrency(liveOptionSignal.stop_loss_premium)}</dd></div>
-                <div><dt>Underlying spot</dt><dd>{toCurrency(liveOptionSignal.spot)}</dd></div>
-              </dl>
-            ) : liveOptionSignal ? (
-              <p>No directional options setup right now. Current {liveOptionSignal.underlying} signal: {liveOptionSignal.signal} ({liveOptionSignal.confidence}% confidence).</p>
-            ) : <p>Waiting for a live signal.</p>}
-            <small>{liveOptionSignal?.note || "Signal, expiry, and option premium require configured Angel One SmartAPI credentials. Target/stop levels are percentage scenarios, not guaranteed fills or investment advice."}</small>
-          </div>
-        </aside>
-      </div>
-      <section className="panel optionOrdersPanel">
-        <div className="panelHead"><h3>Recent paper-order confirmations</h3><small>Saved in this browser only</small></div>
-        {paperOrders.length ? (
-          <div className="optionOrdersList">
-            {paperOrders.map((order) => (
-              <div className="optionOrderRow" key={order.id}>
-                <b>{order.side} {order.quantity} {order.symbol} {order.strike} {order.option_type}</b>
-                <span>{toCurrency(Number(order.price))} · {order.expiry}</span>
-                <small>{order.created_at} · {order.status}</small>
-              </div>
-            ))}
-          </div>
-        ) : <p className="optionSubheading">No paper orders submitted yet.</p>}
-      </section>
-    </>
+    <section className="panel signalOptionAnalysis">
+      <div className="panelHead"><div><p className="eyebrow">READ-ONLY CONTRACT ANALYSIS</p><h3>{symbol} Options Signal</h3></div><label>Analysis style<select value={tradeType} onChange={(event) => setTradeType(event.target.value)}><option value="INTRADAY">Intraday</option><option value="BTST">BTST</option><option value="STBT">STBT</option></select></label></div>
+      {error ? <p className="warningText" role="alert">{error}</p> : loading && !optionSignal ? <p>Connecting to Angel One SmartAPI for index candles and listed contract quotes…</p> : optionSignal?.contract ? <>
+        <div className="signalOptionSummary"><strong>{optionSignal.signal} · {optionSignal.action} {optionSignal.option_type}</strong><span>{optionSignal.contract}</span><span>Expiry {optionSignal.expiry}</span><span>Underlying {toCurrency(optionSignal.spot)}</span></div>
+        <div className="signalOptionPrices"><Row name="Live entry premium" value={toCurrency(optionSignal.entry_premium)} status="Angel One quote" /><Row name="Target premium" value={toCurrency(optionSignal.target_premium)} status="Scenario, not guaranteed" /><Row name="Stop-loss premium" value={toCurrency(optionSignal.stop_loss_premium)} status="Scenario, not guaranteed" /><Row name="Analysis updated" value={optionSignal.updated_at ? new Date(optionSignal.updated_at).toLocaleString() : "—"} status={optionSignal.data_source || "Provider unavailable"} /></div>
+        <p className="warningText">Analysis only. TradeMind does not place or simulate orders. {optionSignal.note}</p>
+      </> : optionSignal ? <p>No option contract signal currently. Underlying status: {optionSignal.signal}. {optionSignal.note}</p> : <p>Waiting for option analysis.</p>}
+    </section>
   );
 }
 

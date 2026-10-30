@@ -167,8 +167,8 @@ def get_live_option_signal(underlying, trade_type):
         "signal_date": trade_date.isoformat(),
         "updated_at": now.isoformat(),
         "data_source": "Angel One SmartAPI",
-        "paper_only": True,
-        "note": "Rule-based directional estimate using Angel One index candles; option levels are live quotes with model percentage exits, not guaranteed fills or investment advice.",
+        "analysis_only": True,
+        "note": "Rule-based directional estimate using Angel One index candles; option levels are live quotes with model percentage exits, not guaranteed fills or investment advice. TradeMind does not place or simulate orders.",
     }
     if direction not in {"BUY", "SELL"}:
         return {**base_response, "contract": None, "expiry": None, "action": None, "entry_premium": None, "target_premium": None, "stop_loss_premium": None}

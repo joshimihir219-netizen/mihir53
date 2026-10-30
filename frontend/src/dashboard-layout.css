@@ -1013,226 +1013,19 @@ main,
   background: #ff6f83;
 }
 
-.optionDemoBadge {
-  padding: 8px 11px;
-  border: 1px solid #8b6c2f;
-  border-radius: 7px;
-  background: #332813;
-  color: #ffda88;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.optionWorkspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1.55fr) minmax(270px, 0.85fr);
-  gap: 16px;
-  align-items: start;
-}
-
-.optionChainPanel,
-.optionTradePanel,
-.optionOrdersPanel {
-  min-width: 0;
-  padding: 18px;
-}
-
-.optionSubheading {
-  margin: 5px 0 0;
-  color: #9bacbf;
-  font-size: 12px;
-}
-
-.optionControls {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin: 16px 0 12px;
-}
-
-.optionControls label,
-.optionTradeForm label {
-  display: grid;
-  gap: 6px;
-  color: #bac8d8;
-  font-size: 12px;
-}
-
-.optionControls select,
-.optionTradeForm select,
-.optionTradeForm input {
-  width: 100%;
-  min-width: 0;
-  padding: 9px 10px;
-  border: 1px solid #28384a;
-  border-radius: 6px;
-  background: #0d141e;
-  color: #eef4fb;
-}
-
-.optionUnderlyingStats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 18px;
-  padding: 10px 0;
-  color: #9bacbf;
-  font-size: 11px;
-}
-
-.optionUnderlyingStats b {
-  margin-left: 4px;
-  color: #e5edf6;
-}
-
-.optionChainScroll {
-  max-height: 430px;
-  overflow: auto;
-  border: 1px solid #223044;
-  border-radius: 7px;
-}
-
-.optionChainTable {
-  width: 100%;
-  border-collapse: collapse;
-  text-align: right;
-  font-size: 12px;
-}
-
-.optionChainTable th,
-.optionChainTable td {
-  padding: 8px;
-  border-bottom: 1px solid #1c2938;
-  white-space: nowrap;
-}
-
-.optionChainTable thead {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: #111b28;
-  color: #aebed0;
-}
-
-.optionChainTable th:nth-child(3),
-.optionChainTable td:nth-child(3) {
-  text-align: center;
-}
-
-.optionChainTable tbody tr:last-child > * {
-  border-bottom: 0;
-}
-
-.optionChainTable .selectedStrike {
-  background: #142338;
-}
-
-.optionChainTable tbody th {
-  color: #f0f5fb;
-}
-
-.optionChainTable tbody th small {
-  color: #55c7a1;
-  font-size: 9px;
-}
-
-.optionSelectButton {
-  padding: 5px 8px;
-  border: 1px solid #314259;
-  border-radius: 5px;
-  background: #121c29;
-  color: #b8c7d8;
-  cursor: pointer;
-}
-
-.optionSelectButton.active {
-  border-color: #3288d5;
-  background: #16395c;
-  color: #e5f4ff;
-}
-
-.optionContractSummary {
-  display: grid;
-  gap: 7px;
-  margin: 14px 0;
-  padding: 13px;
-  border: 1px solid #28394c;
-  border-radius: 8px;
-  background: #101a27;
-}
-
-.optionContractSummary span {
-  color: #b7c7d8;
-  font-size: 12px;
-}
-
-.optionContractSummary strong {
-  color: #f1f6fc;
-  font-size: 23px;
-}
-
-.optionContractSummary small {
-  color: #d8b974;
-  font-size: 11px;
-}
-
-.optionTradeForm {
-  display: grid;
-  gap: 12px;
-}
-
-.optionTradeForm .primary {
-  width: 100%;
-}
-
-.optionTradeForm .primary:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.optionSignal {
+.signalOptionAnalysis {
   margin-top: 16px;
-  padding: 12px;
-  border-left: 3px solid #498cc5;
-  border-radius: 4px;
-  background: #101a27;
-  color: #d5e1ed;
-  font-size: 12px;
-  line-height: 1.55;
 }
 
-.optionSignal .eyebrow {
-  margin: 0 0 7px;
-  color: #82c5f6;
-}
-
-.optionSignalMeta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px 14px;
-  margin-bottom: 9px;
-  color: #9bacbf;
-  font-size: 11px;
-}
-
-.optionSignalMeta b {
-  margin-left: 4px;
-  color: #e1ebf5;
-}
-
-.optionSignalControls {
-  margin: 8px 0 10px;
-}
-
-.optionSignalControls label {
+.signalOptionAnalysis .panelHead > label {
   display: grid;
-  max-width: 310px;
   gap: 5px;
   color: #aebed0;
-  font-size: 11px;
+  font-size: 10px;
 }
 
-.optionSignalControls select {
-  width: 100%;
+.signalOptionAnalysis select {
+  min-width: 130px;
   padding: 7px 9px;
   border: 1px solid #28384a;
   border-radius: 5px;
@@ -1240,101 +1033,34 @@ main,
   color: #eef4fb;
 }
 
-.optionSignalDetails {
+.signalOptionSummary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: center;
+  margin: 12px 0;
+  color: #b7c7d8;
+  font-size: 11px;
+}
+
+.signalOptionSummary strong {
+  color: #74d6ab;
+}
+
+.signalOptionPrices {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin: 10px 0;
-}
-
-.optionSignalDetails > div {
-  min-width: 0;
-  padding: 8px;
-  border: 1px solid #223044;
-  border-radius: 5px;
-  background: #0d141e;
-}
-
-.optionSignalDetails dt {
-  margin-bottom: 4px;
-  color: #9bacbf;
-  font-size: 10px;
-}
-
-.optionSignalDetails dd {
-  margin: 0;
-  color: #edf4fb;
-  font-size: 12px;
-  font-weight: 650;
-  overflow-wrap: anywhere;
-}
-
-.optionSignal p:not(.eyebrow) {
-  margin: 0 0 6px;
-}
-
-.optionSignal small {
-  color: #9bacbf;
-}
-
-.optionError {
-  color: #ff929d;
-  font-size: 12px;
-}
-
-.optionOrdersPanel {
-  margin-top: 16px;
-}
-
-.optionOrdersList {
-  display: grid;
-  gap: 8px;
-}
-
-.optionOrderRow {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 4px 12px;
-  padding: 10px 0;
-  border-bottom: 1px solid #1c2938;
-  font-size: 12px;
-}
-
-.optionOrderRow b {
-  color: #edf4fb;
-}
-
-.optionOrderRow span,
-.optionOrderRow small,
-.optionOrdersPanel .panelHead > small {
-  color: #9bacbf;
-}
-
-.optionOrderRow small {
-  grid-column: 1 / -1;
-}
-
-@media (max-width: 900px) {
-  .optionWorkspace {
-    grid-template-columns: minmax(0, 1fr);
-  }
+  gap: 2px 18px;
 }
 
 @media (max-width: 600px) {
-  .optionControls {
+  .signalOptionAnalysis .panelHead {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .signalOptionPrices {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .optionChainPanel,
-  .optionTradePanel,
-  .optionOrdersPanel {
-    padding: 12px;
-  }
-
-  .optionChainTable th,
-  .optionChainTable td {
-    padding: 7px 5px;
-    font-size: 10px;
   }
 }
 

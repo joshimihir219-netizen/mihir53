@@ -3,7 +3,6 @@ from contextlib import contextmanager
 import hashlib
 import hmac
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -726,53 +725,4 @@ def backtest(
 def risk():
     return {"stop_loss": 2.0, "max_drawdown": 8.0, "daily_loss_limit": 5000, "alert_enabled": True}
 
-@app.post("/api/orders/paper")
-def paper_order(
-    symbol: str,
-    side: str,
-    quantity: float,
-    price: float,
-    option_type: str | None = None,
-    strike: float | None = None,
-    expiry: str | None = None,
-):
-    symbol = symbol.strip()
-    side = side.upper()
-    if not symbol or len(symbol) > 40:
-        raise HTTPException(status_code=422, detail="Symbol must contain 1 to 40 characters.")
-    if side not in {"BUY", "SELL"}:
-        raise HTTPException(status_code=422, detail="Side must be BUY or SELL.")
-    if not math.isfinite(quantity) or not 0 < quantity <= 1_000_000:
-        raise HTTPException(status_code=422, detail="Quantity must be greater than 0 and at most 1,000,000.")
-    if not math.isfinite(price) or price <= 0:
-        raise HTTPException(status_code=422, detail="Price must be a positive finite number.")
-    option_fields = (option_type, strike, expiry)
-    if any(value is not None for value in option_fields) and not all(value is not None for value in option_fields):
-        raise HTTPException(status_code=422, detail="Option type, strike, and expiry must be provided together.")
-    if option_type is not None:
-        option_type = option_type.upper()
-        if option_type not in {"CALL", "PUT"}:
-            raise HTTPException(status_code=422, detail="Option type must be CALL or PUT.")
-        if strike is None or not math.isfinite(strike) or strike <= 0:
-            raise HTTPException(status_code=422, detail="Strike must be a positive finite number.")
-        if expiry is None or len(expiry) != 10:
-            raise HTTPException(status_code=422, detail="Expiry must use YYYY-MM-DD format.")
-    if expiry is not None:
-        try:
-            parsed_expiry = datetime.strptime(expiry, "%Y-%m-%d")
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail="Expiry must use YYYY-MM-DD format.") from error
-        if parsed_expiry.strftime("%Y-%m-%d") != expiry:
-            raise HTTPException(status_code=422, detail="Expiry must use YYYY-MM-DD format.")
-    return {
-        "mode": "PAPER",
-        "status": "accepted",
-        "symbol": symbol,
-        "side": side,
-        "quantity": quantity,
-        "price": price,
-        "option_type": option_type,
-        "strike": strike,
-        "expiry": expiry,
-        "message": "Paper order only. No real money was used.",
-    }
+__all__ = ["app"]
