@@ -1,9 +1,10 @@
 import React, {useEffect, useMemo, useRef, useState} from "react";
 import "./signal-details.css";
 import "./strategy-lab.css";
+import "./auth.css";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
-import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn} from "lucide-react";
+import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, Mail, ArrowLeft, KeyRound, CheckCircle2} from "lucide-react";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler);
 
@@ -71,12 +72,14 @@ function formatSignalMove(entryPrice, currentPrice){
 }
 
 function authHeaders(includeJson = true){
-  const headers = includeJson ? {"Content-Type": "application/json"} : {};
-  try {
-    const token = JSON.parse(localStorage.getItem("trademind-auth-session") || "null")?.accessToken;
-    if (token) headers.Authorization = `Bearer ${token}`;
-  } catch {}
-  return headers;
+  return includeJson ? {"Content-Type": "application/json"} : {};
+}
+
+function initialAuthMode(){
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("verify-email")) return "verify";
+  if (params.has("reset-password")) return "reset";
+  return "login";
 }
 
 function App(){
@@ -105,9 +108,7 @@ function App(){
   });
   const [searchQuery, setSearchQuery] = useState("");
   const [exportMessage, setExportMessage] = useState("");
-  const [isLoggedIn, setIsLoggedIn] = useState(() => {
-    try { return Boolean(JSON.parse(localStorage.getItem("trademind-auth-session") || "null")?.accessToken); } catch { return false; }
-  });
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     try {
@@ -135,10 +136,14 @@ function App(){
       return new Set(Array.isArray(saved) ? saved : []);
     } catch { return new Set(); }
   });
-  const [authMode, setAuthMode] = useState("login");
-  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
+  const [authMode, setAuthMode] = useState(initialAuthMode);
+  const [loginForm, setLoginForm] = useState({ username: "", email: "", password: "" });
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loginError, setLoginError] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [recoveryEmail, setRecoveryEmail] = useState("");
+  const [authToken] = useState(() => new URLSearchParams(window.location.search).get("token") || "");
   const [telegramConfig, setTelegramConfig] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem("trademind-telegram") || "{}");
@@ -194,22 +199,28 @@ function App(){
     async function validateSession(){
       try {
         const savedSession = JSON.parse(localStorage.getItem("trademind-auth-session") || "null");
-        if (!savedSession?.accessToken) {
-          if (!cancelled) setIsLoggedIn(false);
-          return;
-        }
+        const headers = savedSession?.accessToken ? {Authorization: `Bearer ${savedSession.accessToken}`} : {};
         const response = await fetch(API + "/auth/me", {
-          headers: {Authorization: `Bearer ${savedSession.accessToken}`}
+          headers,
         });
         if (!response.ok) throw new Error("Session expired.");
         const account = await response.json();
         if (cancelled) return;
+        localStorage.removeItem("trademind-auth-session");
+        localStorage.removeItem("trademind-session");
         localStorage.setItem("trademind-user", JSON.stringify({username: account.username}));
         setProfile((current) => ({
           ...current,
-          name: current.name === "TradeMind User" ? account.username : current.name
+          name: current.name === "TradeMind User" ? account.username : current.name,
+          email: current.email || account.email || ""
         }));
-        setIsLoggedIn(true);
+        if (account.requires_email_upgrade) {
+          setLoginForm((current) => ({...current, email: account.email || ""}));
+          setAuthMode("upgrade");
+          setIsLoggedIn(false);
+        } else {
+          setIsLoggedIn(true);
+        }
       } catch {
         try {
           localStorage.removeItem("trademind-auth-session");
@@ -303,15 +314,9 @@ function App(){
         addLog(`Telegram delivery failed: ${error}`, "warning");
         return {ok: false, error};
       }
-      const savedSession = JSON.parse(localStorage.getItem("trademind-auth-session") || "null");
-      if (!savedSession?.accessToken) {
-        const error = "Telegram delivery requires an active TradeMind login.";
-        addLog(error, "warning");
-        return {ok: false, error};
-      }
       const response = await fetch(API + "/telegram/send", {
         method: "POST",
-        headers: {"Content-Type": "application/json", Authorization: `Bearer ${savedSession.accessToken}`},
+        headers: {"Content-Type": "application/json"},
         body: JSON.stringify({bot_token: botToken, chat_id: chatId, message})
       });
       const result = await response.json();
@@ -598,55 +603,111 @@ function App(){
 
   async function handleLogin(event){
     event.preventDefault();
-    const username = loginForm.username.trim();
-    const password = loginForm.password;
-    if (username.length < 3 || !password || password.length < 8) {
-      setLoginError("Enter a username with at least 3 characters and a password with at least 8 characters.");
-      return;
-    }
-    if (authMode === "signup" && password !== confirmPassword) {
-      setLoginError("Passwords do not match. Please confirm your account password.");
-      return;
-    }
     setLoginError("");
+    setAuthMessage("");
+    setAuthBusy(true);
     try {
-      const response = await fetch(API + (authMode === "signup" ? "/auth/signup" : "/auth/login"), {
+      let endpoint;
+      let body;
+      if (authMode === "signup") {
+        if (loginForm.password.length < 12) throw new Error("Use a password with at least 12 characters.");
+        if (loginForm.password !== confirmPassword) throw new Error("Passwords do not match.");
+        endpoint = "/auth/signup";
+        body = {username: loginForm.username.trim(), email: loginForm.email.trim(), password: loginForm.password, confirm_password: confirmPassword};
+      } else if (authMode === "login") {
+        endpoint = "/auth/login";
+        body = {username_or_email: loginForm.username.trim(), password: loginForm.password};
+      } else if (authMode === "recovery") {
+        endpoint = "/auth/forgot-password";
+        body = {email: recoveryEmail.trim()};
+      } else if (authMode === "reset") {
+        if (!authToken) throw new Error("This reset link is incomplete. Request a new reset link.");
+        if (loginForm.password.length < 12) throw new Error("Use a password with at least 12 characters.");
+        if (loginForm.password !== confirmPassword) throw new Error("Passwords do not match.");
+        endpoint = "/auth/reset-password";
+        body = {token: authToken, password: loginForm.password, confirm_password: confirmPassword};
+      } else if (authMode === "verify") {
+        if (!authToken) throw new Error("This verification link is incomplete. Request another email.");
+        endpoint = "/auth/verify-email";
+        body = {token: authToken};
+      } else if (authMode === "upgrade") {
+        endpoint = "/auth/upgrade-email";
+        body = {email: loginForm.email.trim()};
+      } else if (authMode === "pending" || authMode === "upgrade_pending") {
+        endpoint = "/auth/resend-verification";
+        body = {email: recoveryEmail.trim() || loginForm.email.trim()};
+      } else {
+        throw new Error("Choose an authentication action to continue.");
+      }
+      const response = await fetch(API + endpoint, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({username, password})
+        body: JSON.stringify(body)
       });
       const result = await response.json();
       if (!response.ok) {
-        setLoginError(result.detail || "Could not authenticate. Please try again.");
-        return;
+        const detail = typeof result.detail === "string"
+          ? result.detail
+          : Array.isArray(result.detail)
+            ? result.detail.map((issue) => issue.msg).filter(Boolean).join(" ")
+            : "Could not complete the request. Please try again.";
+        if (authMode === "signup" && [502, 503].includes(response.status) && /email/i.test(detail)) {
+          setRecoveryEmail(loginForm.email.trim());
+          setAuthMode("pending");
+          setAuthMessage("");
+        }
+        throw new Error(detail);
       }
-      localStorage.setItem("trademind-auth-session", JSON.stringify({accessToken: result.access_token}));
-      localStorage.setItem("trademind-user", JSON.stringify({username: result.username}));
-      localStorage.removeItem("trademind-session");
-      setProfile((current) => ({
-        ...current,
-        name: current.name === "TradeMind User" || current.name === loginForm.username ? result.username : current.name
-      }));
-      setIsLoggedIn(true);
-      addLog(`${authMode === "signup" ? "Signed up and logged in" : "Logged in"} as ${result.username}.`, "success");
-      if (telegramConfig.botToken && telegramConfig.chatId) {
-        notifyTelegram(`TradeMind ${authMode === "signup" ? "signup" : "login"} successful for ${result.username}. Alerts are now enabled.`);
+      if (authMode === "signup") {
+        setRecoveryEmail(loginForm.email.trim());
+        setAuthMode("pending");
+        setAuthMessage(result.message);
+      } else if (authMode === "login") {
+        localStorage.removeItem("trademind-auth-session");
+        localStorage.removeItem("trademind-session");
+        localStorage.setItem("trademind-user", JSON.stringify({username: result.username}));
+        setProfile((current) => ({
+          ...current,
+          name: current.name === "TradeMind User" || current.name === loginForm.username ? result.username : current.name
+        }));
+        setIsLoggedIn(true);
+        addLog(`Logged in as ${result.username}.`, "success");
+        if (telegramConfig.botToken && telegramConfig.chatId) {
+          notifyTelegram(`TradeMind login successful for ${result.username}. Alerts are now enabled.`);
+        }
+      } else if (authMode === "recovery") {
+        setAuthMessage(result.message);
+      } else if (authMode === "reset") {
+        setAuthMode("login");
+        setLoginForm((current) => ({...current, password: ""}));
+        setConfirmPassword("");
+        window.history.replaceState({}, "", window.location.pathname);
+        setAuthMessage(result.message);
+      } else if (authMode === "verify") {
+        setAuthMode("login");
+        window.history.replaceState({}, "", window.location.pathname);
+        setAuthMessage(result.message);
+      } else if (authMode === "upgrade") {
+        setRecoveryEmail(loginForm.email.trim());
+        setAuthMode("upgrade_pending");
+        setAuthMessage(result.message);
+      } else {
+        setAuthMessage(result.message);
       }
-    } catch {
-      setLoginError("Unable to reach the account service. Check that the backend is running, then try again.");
+    } catch (error) {
+      const deliveryFailedAfterSignup = authMode === "signup" && /email/i.test(error.message || "");
+      setLoginError(deliveryFailedAfterSignup
+        ? `Your account was created, but the verification email could not be delivered. ${error.message}`
+        : error.message || "Unable to reach the account service. Please try again.");
+    } finally {
+      setAuthBusy(false);
     }
   }
 
   async function handleLogout(){
     try {
-      const savedSession = JSON.parse(localStorage.getItem("trademind-auth-session") || "null");
-      if (savedSession?.accessToken) {
-        const response = await fetch(API + "/auth/logout", {
-          method: "POST",
-          headers: {Authorization: `Bearer ${savedSession.accessToken}`}
-        });
-        if (!response.ok) addLog("Could not revoke the session on the server; local sign-out completed.", "warning");
-      }
+      const response = await fetch(API + "/auth/logout", {method: "POST"});
+      if (!response.ok) addLog("Could not revoke the session on the server; local sign-out completed.", "warning");
     } catch {
       addLog("Could not revoke the session on the server; local sign-out completed.", "warning");
     }
@@ -754,24 +815,77 @@ function App(){
   }
 
   if (!isLoggedIn) {
+    const showForm = ["login", "signup", "recovery", "reset", "upgrade", "pending", "upgrade_pending"].includes(authMode);
+    const authTitles = {
+      login: "Welcome back",
+      signup: "Create your account",
+      recovery: "Recover your account",
+      reset: "Choose a new password",
+      verify: "Verify your email",
+      pending: "Check your inbox",
+      upgrade: "Secure your account",
+      upgrade_pending: "Verify your email"
+    };
+    const authDescriptions = {
+      login: "Sign in to your trading workspace.",
+      signup: "Start with a verified email and a strong password.",
+      recovery: "Enter your registered email address.",
+      reset: "Use a unique password with at least 12 characters.",
+      verify: "Confirm your address to activate your account.",
+      pending: "Your account is ready once your email is verified.",
+      upgrade: "Add and verify an email to enable account recovery.",
+      upgrade_pending: "Confirm your email to enable account recovery."
+    };
     return (
-      <div className="loginShell">
-        <div className="loginCard">
+      <div className="loginShell authShell">
+        <div className="loginCard authCard">
           <div className="brand"><div className="brandIcon">AI</div><div><b>TradeMind</b><small>AI Trading Lab</small></div></div>
-          <div className="authToggle">
-            <button type="button" className={authMode === "login" ? "toggle active" : "toggle"} onClick={() => setAuthMode("login")}>Log in</button>
-            <button type="button" className={authMode === "signup" ? "toggle active" : "toggle"} onClick={() => setAuthMode("signup")}>Sign up</button>
-          </div>
-          <h1>{authMode === "login" ? "Log in" : "Create account"}</h1>
-          <p>{authMode === "login" ? "Access the live trading dashboard and risk controls." : "Open a new market-ready trading workspace."}</p>
-          <form onSubmit={handleLogin} className="loginForm">
-            <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Choose a username" /></label>
-            <label>Password<input type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} minLength={8} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 8 characters" /></label>
-            {authMode === "signup" && <label>Confirm Password<input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Confirm password" /></label>}
+          {!["login", "signup"].includes(authMode) && <div className="authEyebrow"><span /> ACCOUNT SECURITY</div>}
+          {["login", "signup"].includes(authMode) && (
+            <div className="authToggle" role="tablist" aria-label="Account access">
+              <button type="button" role="tab" aria-selected={authMode === "login"} className={authMode === "login" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button>
+              <button type="button" role="tab" aria-selected={authMode === "signup"} className={authMode === "signup" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Sign up</button>
+            </div>
+          )}
+          <h1>{authTitles[authMode] || "TradeMind account"}</h1>
+          <p className="authDescription">{authDescriptions[authMode] || "Continue securely to TradeMind."}</p>
+          {authMessage && <div className="authMessage" role="status"><CheckCircle2 size={17} /> <span>{authMessage}</span></div>}
+          {showForm && <form onSubmit={handleLogin} className="loginForm authForm">
+            {authMode === "login" && <>
+              <label>Username or email<input autoComplete="username" minLength={3} maxLength={254} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="you@example.com or username" /></label>
+              <label>Password<input type="password" autoComplete="current-password" minLength={8} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="Your password" /></label>
+              <button className="authTextLink forgotLink" type="button" onClick={() => {setAuthMode("recovery"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("");}}>Forgot password?</button>
+            </>}
+            {authMode === "signup" && <>
+              <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Choose a username" /></label>
+              <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={loginForm.email} onChange={(event) => setLoginForm((current) => ({...current, email: event.target.value}))} placeholder="you@example.com" /></label>
+              <label>Password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /></label>
+              <label>Confirm password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /></label>
+            </>}
+            {authMode === "recovery" && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
+            {authMode === "reset" && <>
+              <label>New password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /></label>
+              <label>Confirm new password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /></label>
+            </>}
+            {authMode === "upgrade" && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={loginForm.email} onChange={(event) => setLoginForm((current) => ({...current, email: event.target.value}))} placeholder="you@example.com" /></label>}
+            {["pending", "upgrade_pending"].includes(authMode) && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
             {loginError && <div className="loginError" role="alert">{loginError}</div>}
-            <button className="primary full" type="submit"><LogIn size={16} /> {authMode === "login" ? "Log in" : "Sign up"}</button>
-          </form>
-          <div className="demoCreds">{authMode === "login" ? "Only registered accounts can log in. New here? Sign up to create an account." : "Create a unique account with a username and password of at least 8 characters."}</div>
+            <button className="primary full authSubmit" type="submit" disabled={authBusy}>
+              {authBusy ? <span className="authSpinner" aria-hidden="true" /> : authMode === "login" ? <LogIn size={16} /> : authMode === "recovery" ? <Mail size={16} /> : authMode === "reset" ? <KeyRound size={16} /> : <CheckCircle2 size={16} />}
+              {authBusy ? "Please wait…" : authMode === "login" ? "Log in" : authMode === "signup" ? "Create account" : authMode === "recovery" ? "Send reset link" : authMode === "reset" ? "Reset password" : authMode === "upgrade" ? "Send verification link" : "Resend verification email"}
+            </button>
+          </form>}
+          {!showForm && <>
+            {loginError && <div className="loginError" role="alert">{loginError}</div>}
+            <button className="primary full authSubmit" type="button" onClick={handleLogin} disabled={authBusy}>
+              {authBusy ? <span className="authSpinner" aria-hidden="true" /> : authMode === "verify" ? <Mail size={16} /> : <CheckCircle2 size={16} />}
+              {authBusy ? "Please wait…" : authMode === "verify" ? "Verify email" : "Send another verification email"}
+            </button>
+            {authMode === "verify" && <button className="authTextLink authResendLink" type="button" onClick={() => {setAuthMode("pending"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("Enter your email address to request another verification link.");}}>Request another verification email</button>}
+          </>}
+          {authMode === "login" && <p className="authFooter">New to TradeMind? <button type="button" className="authTextLink" onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Create an account</button></p>}
+          {authMode === "signup" && <p className="authFooter">Already registered? <button type="button" className="authTextLink" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button></p>}
+          {["recovery", "reset", "verify", "pending", "upgrade", "upgrade_pending"].includes(authMode) && <button className="authBack" type="button" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}><ArrowLeft size={15} /> Back to login</button>}
         </div>
       </div>
     );
@@ -1587,11 +1701,9 @@ function OptionsAnalysis({symbol, isLoggedIn, addLog}){
       setLoading(true);
       setError("");
       try {
-        const savedSession = JSON.parse(localStorage.getItem("trademind-auth-session") || "null");
-        if (!savedSession?.accessToken) throw new Error("Sign in to load live option contract analysis.");
         const params = new URLSearchParams({trade_type: tradeType});
         const response = await fetch(`${API}/options/signal/${encodeURIComponent(symbol)}?${params}`, {
-          headers: {Authorization: `Bearer ${savedSession.accessToken}`}
+          headers: authHeaders(false)
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "Unable to load option analysis.");

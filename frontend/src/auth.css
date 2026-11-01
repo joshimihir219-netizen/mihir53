@@ -1,0 +1,253 @@
+.authShell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 28px 18px;
+  background-color: #081019;
+  background-image:
+    linear-gradient(rgba(141, 166, 184, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(141, 166, 184, 0.045) 1px, transparent 1px);
+  background-size: 34px 34px;
+}
+
+.authCard {
+  width: min(100%, 438px);
+  max-width: none;
+  padding: 34px;
+  border: 1px solid #263644;
+  border-radius: 6px;
+  background: #101923;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+  animation: auth-rise 260ms ease-out both;
+}
+
+.authCard .brand {
+  margin-bottom: 30px;
+}
+
+.authCard .brandIcon {
+  background: #35d0a1;
+  color: #07130f;
+}
+
+.authCard .authToggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 28px;
+  border: 1px solid #263644;
+  border-radius: 4px;
+  background: #0a121a;
+}
+
+.authCard .authToggle .toggle {
+  min-height: 38px;
+  border: 0;
+  border-radius: 3px;
+  color: #94a5b4;
+  background: transparent;
+}
+
+.authCard .authToggle .toggle.active {
+  color: #eaf5f2;
+  background: #1c2a35;
+}
+
+.authCard h1 {
+  margin: 0;
+  color: #f0f5f8;
+  font-size: 25px;
+  line-height: 1.2;
+}
+
+.authDescription {
+  margin: 9px 0 24px;
+  color: #94a5b4;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.authEyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 17px;
+  color: #8295a5;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.authEyebrow span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #35d0a1;
+}
+
+.authCard .authForm {
+  display: grid;
+  gap: 16px;
+}
+
+.authCard .authForm label {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  color: #c4d0d9;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.authCard .authForm input {
+  box-sizing: border-box;
+  min-height: 44px;
+  width: 100%;
+  margin: 0;
+  padding: 0 12px;
+  border: 1px solid #30414f;
+  border-radius: 3px;
+  outline: none;
+  background: #0a121a;
+  color: #edf4f7;
+  font: inherit;
+  font-size: 14px;
+}
+
+.authCard .authForm input::placeholder {
+  color: #657887;
+}
+
+.authCard .authForm input:focus {
+  border-color: #35d0a1;
+  box-shadow: 0 0 0 3px rgba(53, 208, 161, 0.12);
+}
+
+.authCard .forgotLink {
+  justify-self: end;
+  margin-top: -8px;
+}
+
+.authCard .authTextLink {
+  border: 0;
+  padding: 0;
+  color: #55d7ae;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.authCard .authTextLink:hover,
+.authCard .authBack:hover {
+  color: #a0f0d7;
+}
+
+.authCard .authResendLink {
+  display: block;
+  margin-top: 16px;
+}
+
+.authCard .authSubmit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 46px;
+  margin-top: 3px;
+  border-radius: 3px;
+}
+
+.authCard .authSubmit:disabled {
+  cursor: wait;
+  opacity: 0.75;
+}
+
+.authCard .loginError {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(241, 105, 105, 0.35);
+  border-radius: 3px;
+  background: rgba(130, 39, 45, 0.18);
+  color: #ffaaaa;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.authMessage {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0 0 18px;
+  padding: 12px;
+  border: 1px solid rgba(53, 208, 161, 0.3);
+  border-radius: 3px;
+  background: rgba(53, 208, 161, 0.08);
+  color: #b7efdc;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.authMessage svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: #55d7ae;
+}
+
+.authFooter {
+  margin: 23px 0 0;
+  color: #91a1af;
+  font-size: 13px;
+  text-align: center;
+}
+
+.authBack {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 21px;
+  padding: 0;
+  border: 0;
+  color: #9cadba;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.authSpinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid rgba(7, 19, 15, 0.3);
+  border-top-color: #07130f;
+  border-radius: 50%;
+  animation: auth-spin 700ms linear infinite;
+}
+
+@keyframes auth-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes auth-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 480px) {
+  .authShell {
+    padding: 14px;
+    align-items: start;
+  }
+
+  .authCard {
+    margin-top: max(12px, 4vh);
+    padding: 25px 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .authCard,
+  .authSpinner {
+    animation: none;
+  }
+}

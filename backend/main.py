@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import hashlib
 import hmac
+from html import escape as escape_html
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import sqlite3
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import psycopg
@@ -25,7 +26,13 @@ from market_data import TIMEFRAME_HISTORY, market_frame, _duration_offset, _max_
 from angel_options import get_live_option_signal
 
 app = FastAPI(title="AI Trading Dashboard API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(",") if origin.strip()],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 SYMBOLS = [
     "NIFTY 50", "BANK NIFTY", "SENSEX",
@@ -41,11 +48,35 @@ DATABASE_URL = (
 )
 PASSWORD_ITERATIONS = 310_000
 SESSION_LIFETIME = timedelta(days=30)
+EMAIL_VERIFICATION_LIFETIME = timedelta(hours=24)
+PASSWORD_RESET_LIFETIME = timedelta(hours=1)
+AUTH_RATE_WINDOW = timedelta(minutes=15)
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
-class Credentials(BaseModel):
+class SignupPayload(BaseModel):
     username: str = Field(min_length=3, max_length=50)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=12, max_length=128)
+    confirm_password: str = Field(min_length=12, max_length=128)
+
+
+class LoginPayload(BaseModel):
+    username_or_email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=128)
+
+
+class EmailPayload(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class TokenPayload(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class PasswordResetPayload(TokenPayload):
+    password: str = Field(min_length=12, max_length=128)
+    confirm_password: str = Field(min_length=12, max_length=128)
 
 
 class TelegramMessage(BaseModel):
@@ -100,6 +131,34 @@ def _execute(connection, query, parameters=()):
     return connection.execute(query, parameters)
 
 
+def _ensure_user_columns(connection):
+    if DATABASE_URL:
+        columns = {
+            row["column_name"]
+            for row in _execute(
+                connection,
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'users'",
+            ).fetchall()
+        }
+        additions = {
+            "email": "TEXT",
+            "email_verified": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "password_updated_at": "TEXT",
+        }
+    else:
+        columns = {row["name"] for row in _execute(connection, "PRAGMA table_info(users)").fetchall()}
+        additions = {
+            "email": "TEXT",
+            "email_verified": "INTEGER NOT NULL DEFAULT 0",
+            "password_updated_at": "TEXT",
+        }
+    for column, definition in additions.items():
+        if DATABASE_URL:
+            _execute(connection, f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} {definition}")
+        elif column not in columns:
+            _execute(connection, f"ALTER TABLE users ADD COLUMN {column} {definition}")
+
+
 def _initialize_auth_db():
     if os.environ.get("VERCEL") and not DATABASE_URL:
         return
@@ -150,10 +209,36 @@ def _initialize_auth_db():
                 )
                 """,
             )
+        _ensure_user_columns(connection)
         _execute(
             connection,
             "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username))",
         )
+        _execute(
+            connection,
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users (LOWER(email)) WHERE email IS NOT NULL",
+        )
+        if DATABASE_URL:
+            user_id_type = "BIGINT"
+        else:
+            user_id_type = "INTEGER"
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id {user_id_type} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                purpose TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT
+            )
+        """)
+        _execute(connection, "CREATE INDEX IF NOT EXISTS auth_tokens_user_purpose_idx ON auth_tokens (user_id, purpose)")
+        _execute(connection, """
+            CREATE TABLE IF NOT EXISTS auth_rate_limits (
+                bucket_key TEXT PRIMARY KEY,
+                reset_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL
+            )
+        """)
         if DATABASE_URL:
             strategy_id = "BIGSERIAL PRIMARY KEY"
             user_id_type = "BIGINT"
@@ -211,8 +296,166 @@ def _initialize_auth_db():
 _initialize_auth_db()
 
 
+@app.middleware("http")
+async def session_cookie_auth(request: Request, call_next):
+    if not request.headers.get("authorization"):
+        token = request.cookies.get("trademind_session", "")
+        if re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+            request.scope["headers"] = list(request.scope["headers"]) + [
+                (b"authorization", f"Bearer {token}".encode("ascii"))
+            ]
+    return await call_next(request)
+
+
 def _hash_password(password: str, salt: bytes) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+
+
+def _set_session_cookie(response: Response, request: Request, token: str):
+    secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https" or bool(os.environ.get("VERCEL"))
+    response.set_cookie(
+        "trademind_session",
+        token,
+        max_age=int(SESSION_LIFETIME.total_seconds()),
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _normalized_email(value: str) -> str:
+    email = value.strip().casefold()
+    if len(email) > 254 or not EMAIL_PATTERN.fullmatch(email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    return email
+
+
+def _rate_limit(request: Request, action: str, limit: int, subject: str | None = None):
+    address = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if not address:
+        address = request.client.host if request.client else "unknown"
+    buckets = [hashlib.sha256(f"{action}:address:{address}".encode("utf-8")).hexdigest()]
+    if subject:
+        normalized_subject = subject.strip().casefold()
+        buckets.append(hashlib.sha256(f"{action}:subject:{normalized_subject}".encode("utf-8")).hexdigest())
+    now = datetime.now(timezone.utc)
+    reset_at = (now + AUTH_RATE_WINDOW).isoformat()
+    with _auth_connection() as connection:
+        _execute(connection, "DELETE FROM auth_rate_limits WHERE reset_at <= ?", (now.isoformat(),))
+        token_retention_cutoff = (now - timedelta(days=1)).isoformat()
+        _execute(connection, "DELETE FROM auth_tokens WHERE expires_at <= ? OR consumed_at <= ?", (now.isoformat(), token_retention_cutoff))
+        exceeded = False
+        for bucket in buckets:
+            row = _execute(
+                connection,
+                """
+                INSERT INTO auth_rate_limits (bucket_key, reset_at, attempts)
+                VALUES (?, ?, 1)
+                ON CONFLICT (bucket_key) DO UPDATE SET
+                    attempts = CASE WHEN auth_rate_limits.reset_at <= ? THEN 1 ELSE auth_rate_limits.attempts + 1 END,
+                    reset_at = CASE WHEN auth_rate_limits.reset_at <= ? THEN ? ELSE auth_rate_limits.reset_at END
+                RETURNING attempts
+                """,
+                (bucket, reset_at, now.isoformat(), now.isoformat(), reset_at),
+            ).fetchone()
+            exceeded = exceeded or int(row["attempts"]) > limit
+    if exceeded:
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes and try again.", headers={"Retry-After": str(int(AUTH_RATE_WINDOW.total_seconds()))})
+
+
+def _create_auth_token(connection, user_id: int, purpose: str, lifetime: timedelta) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
+    _execute(connection, "DELETE FROM auth_tokens WHERE user_id = ? AND purpose = ? AND consumed_at IS NULL", (user_id, purpose))
+    _execute(
+        connection,
+        "INSERT INTO auth_tokens (token_hash, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)",
+        (token_hash, user_id, purpose, (datetime.now(timezone.utc) + lifetime).isoformat()),
+    )
+    return token
+
+
+def _send_auth_email(recipient: str, subject: str, title: str, body: str, action_label: str, action_url: str, expiry_note: str):
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    sender_email = os.environ.get("EMAIL_FROM", "").strip()
+    sender_name = os.environ.get("EMAIL_FROM_NAME", "TradeMind").strip() or "TradeMind"
+    if not api_key or not sender_email:
+        raise HTTPException(status_code=503, detail="Email delivery is not configured. Set RESEND_API_KEY and EMAIL_FROM on the backend.")
+    safe_title = escape_html(title)
+    safe_body = escape_html(body)
+    safe_label = escape_html(action_label)
+    safe_url = escape_html(action_url, quote=True)
+    safe_expiry = escape_html(expiry_note)
+    html = f"""<div style="font-family:Arial,sans-serif;background:#0b1118;color:#e8eef5;padding:32px">
+      <div style="max-width:560px;margin:0 auto;border:1px solid #273543;padding:28px;background:#111b25">
+      <p style="color:#35d0a1;font-weight:700;letter-spacing:1px">TRADEMIND</p><h1>{safe_title}</h1>
+      <p style="line-height:1.6;color:#b8c5d2">{safe_body}</p>
+      <p><a href="{safe_url}" style="display:inline-block;background:#35d0a1;color:#07130f;padding:12px 18px;text-decoration:none;font-weight:700">{safe_label}</a></p>
+      <p style="font-size:13px;color:#93a3b3">{safe_expiry}</p><p style="font-size:12px;color:#718293">If you did not request this, you can ignore this message.</p>
+      </div></div>"""
+    payload = json.dumps({
+        "from": f"{sender_name} <{sender_email}>",
+        "to": [recipient],
+        "subject": subject,
+        "html": html,
+    }).encode("utf-8")
+    request = Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail="TradeMind could not deliver the email. Please try again later.") from error
+    except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail="TradeMind could not deliver the email. Please try again later.") from error
+    if not isinstance(result, dict) or not result.get("id"):
+        raise HTTPException(status_code=502, detail="The email provider did not confirm delivery. Please try again later.")
+
+
+def _app_base_url() -> str:
+    configured = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    deployment_url = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or os.environ.get("VERCEL_URL")
+    if deployment_url:
+        return f"https://{deployment_url.removeprefix('https://').removeprefix('http://').rstrip('/')}"
+    if os.environ.get("VERCEL"):
+        raise HTTPException(status_code=503, detail="APP_BASE_URL must be configured for authentication emails on Vercel.")
+    return "http://localhost:5173"
+
+
+def _send_verification_email(email: str, token: str):
+    base_url = _app_base_url()
+    url = f"{base_url}/?verify-email&token={token}"
+    _send_auth_email(
+        email,
+        "Verify your TradeMind email",
+        "Verify your email address",
+        "Confirm this email address to activate your TradeMind account.",
+        "Verify email",
+        url,
+        "This verification link expires in 24 hours.",
+    )
+
+
+def _send_password_reset_email(email: str, token: str):
+    base_url = _app_base_url()
+    url = f"{base_url}/?reset-password&token={token}"
+    _send_auth_email(
+        email,
+        "Reset your TradeMind password",
+        "Reset your password",
+        "We received a request to change the password for your TradeMind account.",
+        "Choose a new password",
+        url,
+        "This link expires in one hour. If it expires, request another reset from the login page.",
+    )
 
 
 def _new_session(connection, user_id: int) -> str:
@@ -234,53 +477,67 @@ def _session_token(authorization: str | None) -> str:
 
 
 @app.post("/api/auth/signup", status_code=201)
-def signup(credentials: Credentials):
-    username = credentials.username.strip()
-    if not username:
-        raise HTTPException(status_code=422, detail="Username is required.")
+def signup(payload: SignupPayload, request: Request):
+    _rate_limit(request, "signup", 5, payload.email)
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=422, detail="Passwords do not match.")
+    username = payload.username.strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=422, detail="Username must contain at least 3 characters.")
+    email = _normalized_email(payload.email)
     salt = secrets.token_bytes(16)
-    password_hash = _hash_password(credentials.password, salt)
+    password_hash = _hash_password(payload.password, salt)
     try:
         with _auth_connection() as connection:
+            if _execute(connection, "SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
+                raise HTTPException(status_code=409, detail="That username is already taken. Choose another username.")
+            if _execute(connection, "SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone():
+                raise HTTPException(status_code=409, detail="That email is already registered. Log in or reset your password.")
+            created_at = datetime.now(timezone.utc).isoformat()
             if DATABASE_URL:
                 cursor = _execute(
                     connection,
-                    "INSERT INTO users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?) RETURNING id",
-                    (username, salt, password_hash, datetime.now(timezone.utc).isoformat()),
+                    "INSERT INTO users (username, email, email_verified, password_salt, password_hash, created_at, password_updated_at) VALUES (?, ?, FALSE, ?, ?, ?, ?) RETURNING id",
+                    (username, email, salt, password_hash, created_at, created_at),
                 )
                 user_id = int(cursor.fetchone()["id"])
             else:
                 cursor = _execute(
                     connection,
-                    "INSERT INTO users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
-                    (username, salt, password_hash, datetime.now(timezone.utc).isoformat()),
+                    "INSERT INTO users (username, email, email_verified, password_salt, password_hash, created_at, password_updated_at) VALUES (?, ?, 0, ?, ?, ?, ?)",
+                    (username, email, salt, password_hash, created_at, created_at),
                 )
                 user_id = int(cursor.lastrowid)
-            token = _new_session(connection, user_id)
+            token = _create_auth_token(connection, user_id, "verify_email", EMAIL_VERIFICATION_LIFETIME)
     except (sqlite3.IntegrityError, psycopg.IntegrityError) as error:
-        raise HTTPException(status_code=409, detail="An account with that username already exists. Log in instead.") from error
-    return {"access_token": token, "token_type": "bearer", "username": username}
+        if "email" in str(error).lower():
+            raise HTTPException(status_code=409, detail="That email is already registered. Log in or reset your password.") from error
+        raise HTTPException(status_code=409, detail="That username is already taken. Choose another username.") from error
+    _send_verification_email(email, token)
+    return {"message": "Account created. Check your email for a verification link before logging in."}
 
 
 @app.post("/api/auth/login")
-def login(credentials: Credentials):
+def login(payload: LoginPayload, request: Request, response: Response):
+    identifier = payload.username_or_email.strip()
+    _rate_limit(request, "login", 10, identifier)
     with _auth_connection() as connection:
-        user = _execute(
-            connection,
-            "SELECT id, username, password_salt, password_hash FROM users WHERE LOWER(username) = LOWER(?)",
-            (credentials.username.strip(),),
-        ).fetchone()
+        if "@" in identifier:
+            user = _execute(connection, "SELECT id, username, email, email_verified, password_salt, password_hash FROM users WHERE LOWER(email) = LOWER(?)", (identifier,)).fetchone()
+        else:
+            user = _execute(connection, "SELECT id, username, email, email_verified, password_salt, password_hash FROM users WHERE LOWER(username) = LOWER(?)", (identifier,)).fetchone()
         if user is None or not hmac.compare_digest(
-            _hash_password(credentials.password, user["password_salt"]),
+            _hash_password(payload.password, user["password_salt"]),
             user["password_hash"],
-        ):
-            raise HTTPException(status_code=401, detail="Account not found or password incorrect. Sign up if you don't have an account.")
+        ) or (user["email"] and not user["email_verified"]):
+            raise HTTPException(status_code=401, detail="Unable to log in. Verify your email if needed, or check your credentials.")
         token = _new_session(connection, int(user["id"]))
-    return {"access_token": token, "token_type": "bearer", "username": user["username"]}
+    _set_session_cookie(response, request, token)
+    return {"username": user["username"]}
 
 
 @app.get("/api/auth/me")
-def current_user(authorization: str | None = Header(default=None)):
+def current_user(request: Request, response: Response, authorization: str | None = Header(default=None)):
     token = _session_token(authorization)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc).isoformat()
@@ -288,7 +545,7 @@ def current_user(authorization: str | None = Header(default=None)):
         user = _execute(
             connection,
             """
-            SELECT users.username, auth_sessions.expires_at
+            SELECT users.username, users.email, users.email_verified, auth_sessions.expires_at
             FROM auth_sessions JOIN users ON users.id = auth_sessions.user_id
             WHERE auth_sessions.token_hash = ?
             """,
@@ -297,16 +554,109 @@ def current_user(authorization: str | None = Header(default=None)):
         if user is None or user["expires_at"] <= now:
             _execute(connection, "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
-    return {"username": user["username"]}
+    if not request.cookies.get("trademind_session") and authorization:
+        _set_session_cookie(response, request, token)
+    return {
+        "username": user["username"],
+        "email": user["email"],
+        "email_verified": bool(user["email_verified"]),
+        "requires_email_upgrade": not user["email"] or not user["email_verified"],
+    }
+
+
+@app.post("/api/auth/verify-email")
+def verify_email(payload: TokenPayload, request: Request):
+    _rate_limit(request, "verify_email", 10, payload.token)
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        token = _execute(connection, "SELECT user_id FROM auth_tokens WHERE token_hash = ? AND purpose = 'verify_email' AND consumed_at IS NULL AND expires_at > ?", (token_hash, now)).fetchone()
+        if token is None:
+            raise HTTPException(status_code=400, detail="This verification link is invalid, expired, or already used. Request another email.")
+        result = _execute(connection, "UPDATE auth_tokens SET consumed_at = ? WHERE token_hash = ? AND purpose = 'verify_email' AND consumed_at IS NULL AND expires_at > ?", (now, token_hash, now))
+        if result.rowcount != 1:
+            raise HTTPException(status_code=400, detail="This verification link is invalid, expired, or already used. Request another email.")
+        _execute(connection, "UPDATE users SET email_verified = TRUE WHERE id = ?", (int(token["user_id"]),))
+    return {"message": "Email verified. You can now log in to TradeMind."}
+
+
+@app.post("/api/auth/resend-verification")
+def resend_verification(payload: EmailPayload, request: Request):
+    _rate_limit(request, "resend_verification", 5, payload.email)
+    email = _normalized_email(payload.email)
+    verification_token = None
+    with _auth_connection() as connection:
+        user = _execute(connection, "SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND email_verified = FALSE", (email,)).fetchone()
+        if user:
+            verification_token = _create_auth_token(connection, int(user["id"]), "verify_email", EMAIL_VERIFICATION_LIFETIME)
+    if verification_token:
+        _send_verification_email(email, verification_token)
+    return {"message": "If this account needs verification, a new link will be sent shortly."}
+
+
+@app.post("/api/auth/upgrade-email")
+def upgrade_email(payload: EmailPayload, request: Request, authorization: str | None = Header(default=None)):
+    _rate_limit(request, "upgrade_email", 5, payload.email)
+    email = _normalized_email(payload.email)
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        existing = _execute(connection, "SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone()
+        if existing and int(existing["id"]) != user_id:
+            raise HTTPException(status_code=409, detail="That email is already registered. Choose another email address.")
+        current = _execute(connection, "SELECT email, email_verified FROM users WHERE id = ?", (user_id,)).fetchone()
+        if current and current["email"] and current["email_verified"]:
+            raise HTTPException(status_code=409, detail="This account already has a verified email address.")
+        _execute(connection, "UPDATE users SET email = ?, email_verified = FALSE WHERE id = ?", (email, user_id))
+        verification_token = _create_auth_token(connection, user_id, "verify_email", EMAIL_VERIFICATION_LIFETIME)
+    _send_verification_email(email, verification_token)
+    return {"message": "Verification email sent. Confirm the address to enable email recovery."}
+
+
+@app.post("/api/auth/forgot-password", status_code=202)
+def forgot_password(payload: EmailPayload, request: Request):
+    _rate_limit(request, "forgot_password", 5, payload.email)
+    email = _normalized_email(payload.email)
+    reset_token = None
+    with _auth_connection() as connection:
+        user = _execute(connection, "SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND email_verified = TRUE", (email,)).fetchone()
+        if user:
+            reset_token = _create_auth_token(connection, int(user["id"]), "password_reset", PASSWORD_RESET_LIFETIME)
+    if reset_token:
+        _send_password_reset_email(email, reset_token)
+    return {"message": "If an account exists for this email, you will receive a password reset link shortly."}
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(payload: PasswordResetPayload, request: Request, response: Response):
+    _rate_limit(request, "reset_password", 10, payload.token)
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=422, detail="Passwords do not match.")
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
+    salt = secrets.token_bytes(16)
+    password_hash = _hash_password(payload.password, salt)
+    with _auth_connection() as connection:
+        token = _execute(connection, "SELECT user_id FROM auth_tokens WHERE token_hash = ? AND purpose = 'password_reset' AND consumed_at IS NULL AND expires_at > ?", (token_hash, now)).fetchone()
+        if token is None:
+            raise HTTPException(status_code=400, detail="This reset link is invalid, expired, or already used. Request another reset.")
+        result = _execute(connection, "UPDATE auth_tokens SET consumed_at = ? WHERE token_hash = ? AND purpose = 'password_reset' AND consumed_at IS NULL AND expires_at > ?", (now, token_hash, now))
+        if result.rowcount != 1:
+            raise HTTPException(status_code=400, detail="This reset link is invalid, expired, or already used. Request another reset.")
+        _execute(connection, "UPDATE users SET password_salt = ?, password_hash = ?, password_updated_at = ? WHERE id = ?", (salt, password_hash, now, int(token["user_id"])))
+        _execute(connection, "DELETE FROM auth_sessions WHERE user_id = ?", (int(token["user_id"]),))
+    response.delete_cookie("trademind_session", path="/", httponly=True, secure=request.url.scheme == "https" or bool(os.environ.get("VERCEL")), samesite="lax")
+    return {"message": "Password updated. Log in with your new password."}
 
 
 def _authenticated_user_id(authorization: str | None) -> int:
-    username = current_user(authorization)["username"]
+    token = _session_token(authorization)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
     with _auth_connection() as connection:
-        user = _execute(connection, "SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
-    if user is None:
-        raise HTTPException(status_code=401, detail="Account is no longer available.")
-    return int(user["id"])
+        session = _execute(connection, "SELECT user_id, expires_at FROM auth_sessions WHERE token_hash = ?", (token_hash,)).fetchone()
+    if session is None or session["expires_at"] <= now:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    return int(session["user_id"])
 
 
 def _strategy_record(row):
@@ -460,11 +810,18 @@ def list_backtests(authorization: str | None = Header(default=None)):
 
 
 @app.post("/api/auth/logout", status_code=204)
-def logout(authorization: str | None = Header(default=None)):
+def logout(request: Request, response: Response, authorization: str | None = Header(default=None)):
     token = _session_token(authorization)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with _auth_connection() as connection:
         _execute(connection, "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+    response.delete_cookie(
+        "trademind_session",
+        path="/",
+        httponly=True,
+        secure=request.url.scheme == "https" or bool(os.environ.get("VERCEL")),
+        samesite="lax",
+    )
     return None
 
 
