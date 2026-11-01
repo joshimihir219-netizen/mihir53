@@ -4,7 +4,7 @@ import "./strategy-lab.css";
 import "./auth.css";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
-import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, Mail, ArrowLeft, KeyRound, CheckCircle2, Eye, EyeOff} from "lucide-react";
+import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, CheckCircle2, Eye, EyeOff} from "lucide-react";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler);
 
@@ -114,13 +114,6 @@ function passwordStrength(password){
   return {score, label: score <= 2 ? "Weak" : score <= 3 ? "Fair" : "Strong"};
 }
 
-function initialAuthMode(){
-  const params = new URLSearchParams(window.location.search);
-  if (params.has("verify-email")) return "verify";
-  if (params.has("reset-password")) return "reset";
-  return "login";
-}
-
 function App(){
   const [page, setPage] = useState("Dashboard");
   const [symbol, setSymbol] = useState("NIFTY 50");
@@ -175,14 +168,12 @@ function App(){
       return new Set(Array.isArray(saved) ? saved : []);
     } catch { return new Set(); }
   });
-  const [authMode, setAuthMode] = useState(initialAuthMode);
-  const [loginForm, setLoginForm] = useState({ username: "", email: "", password: "" });
+  const [authMode, setAuthMode] = useState("login");
+  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [authMessage, setAuthMessage] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
-  const [recoveryEmail, setRecoveryEmail] = useState("");
-  const [authToken] = useState(() => new URLSearchParams(window.location.search).get("token") || "");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [confirmPasswordVisible, setConfirmPasswordVisible] = useState(false);
   const [telegramConfig, setTelegramConfig] = useState(() => {
@@ -252,16 +243,9 @@ function App(){
         localStorage.setItem("trademind-user", JSON.stringify({username: account.username}));
         setProfile((current) => ({
           ...current,
-          name: current.name === "TradeMind User" ? account.username : current.name,
-          email: current.email || account.email || ""
+          name: current.name === "TradeMind User" ? account.username : current.name
         }));
-        if (account.requires_email_upgrade) {
-          setLoginForm((current) => ({...current, email: account.email || ""}));
-          setAuthMode("upgrade");
-          setIsLoggedIn(false);
-        } else {
-          setIsLoggedIn(true);
-        }
+        setIsLoggedIn(true);
       } catch {
         try {
           localStorage.removeItem("trademind-auth-session");
@@ -648,41 +632,14 @@ function App(){
     setAuthMessage("");
     setAuthBusy(true);
     try {
-      let endpoint;
-      let body;
       if (authMode === "signup") {
         if (loginForm.password.length < 12) throw new Error("Use a password with at least 12 characters.");
         if (loginForm.password !== confirmPassword) throw new Error("Passwords do not match.");
-        endpoint = "/auth/signup";
-        body = {username: loginForm.username.trim(), email: loginForm.email.trim(), password: loginForm.password, confirm_password: confirmPassword};
-      } else if (authMode === "login") {
-        endpoint = "/auth/login";
-        body = {username_or_email: loginForm.username.trim(), password: loginForm.password};
-      } else if (authMode === "recovery") {
-        endpoint = "/auth/forgot-password";
-        body = {email: recoveryEmail.trim()};
-      } else if (authMode === "forgotUsername") {
-        endpoint = "/auth/forgot-username";
-        body = {email: recoveryEmail.trim()};
-      } else if (authMode === "reset") {
-        if (!authToken) throw new Error("This reset link is incomplete. Request a new reset link.");
-        if (loginForm.password.length < 12) throw new Error("Use a password with at least 12 characters.");
-        if (loginForm.password !== confirmPassword) throw new Error("Passwords do not match.");
-        endpoint = "/auth/reset-password";
-        body = {token: authToken, password: loginForm.password, confirm_password: confirmPassword};
-      } else if (authMode === "verify") {
-        if (!authToken) throw new Error("This verification link is incomplete. Request another email.");
-        endpoint = "/auth/verify-email";
-        body = {token: authToken};
-      } else if (authMode === "upgrade") {
-        endpoint = "/auth/upgrade-email";
-        body = {email: loginForm.email.trim()};
-      } else if (authMode === "pending" || authMode === "upgrade_pending") {
-        endpoint = "/auth/resend-verification";
-        body = {email: recoveryEmail.trim() || loginForm.email.trim()};
-      } else {
-        throw new Error("Choose an authentication action to continue.");
       }
+      const endpoint = authMode === "signup" ? "/auth/signup" : "/auth/login";
+      const body = authMode === "signup"
+        ? {username: loginForm.username.trim(), password: loginForm.password, confirm_password: confirmPassword}
+        : {username: loginForm.username.trim(), password: loginForm.password};
       const response = await fetch(API + endpoint, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -690,8 +647,9 @@ function App(){
       });
       const result = await readApiResponse(response, "Could not complete the request. Please try again.");
       if (authMode === "signup") {
-        setRecoveryEmail(loginForm.email.trim());
-        setAuthMode("pending");
+        setAuthMode("login");
+        setLoginForm((current) => ({...current, password: ""}));
+        setConfirmPassword("");
         setAuthMessage(result.message);
       } else if (authMode === "login") {
         localStorage.removeItem("trademind-auth-session");
@@ -706,41 +664,8 @@ function App(){
         if (telegramConfig.botToken && telegramConfig.chatId) {
           notifyTelegram(`TradeMind login successful for ${result.username}. Alerts are now enabled.`);
         }
-      } else if (authMode === "recovery") {
-        setAuthMessage(result.message);
-      } else if (authMode === "forgotUsername") {
-        setAuthMessage(result.message);
-      } else if (authMode === "reset") {
-        setAuthMode("login");
-        setLoginForm((current) => ({...current, password: ""}));
-        setConfirmPassword("");
-        window.history.replaceState({}, "", window.location.pathname);
-        setAuthMessage(result.message);
-      } else if (authMode === "verify") {
-        setAuthMode("login");
-        window.history.replaceState({}, "", window.location.pathname);
-        setAuthMessage(result.message);
-      } else if (authMode === "upgrade") {
-        setRecoveryEmail(loginForm.email.trim());
-        setAuthMode("upgrade_pending");
-        setAuthMessage(result.message);
-      } else {
-        setAuthMessage(result.message);
       }
     } catch (error) {
-      if (authMode === "login" && error.code === "email_unverified") {
-        setRecoveryEmail(loginForm.username.includes("@") ? loginForm.username.trim() : "");
-        setAuthMode("pending");
-        setAuthMessage("Verify your email to finish signing in. Enter your registered email below to request another link.");
-      } else if (authMode === "signup" && error.status === 409 && error.message.startsWith("This email is already registered")) {
-        setRecoveryEmail(loginForm.email.trim());
-        setAuthMode("pending");
-        setAuthMessage("This email is already registered. Log in or reset your password. If it is not verified yet, request another verification link below.");
-      } else if (authMode === "signup" && [502, 503].includes(error.status) && /email/i.test(error.message || "")) {
-        setRecoveryEmail(loginForm.email.trim());
-        setAuthMode("pending");
-        setAuthMessage("Your account was created, but its verification email could not be delivered. Request another link below.");
-      }
       const rateLimitHint = error.status === 429 && error.retryAfter
         ? ` Please wait about ${error.retryAfter} seconds before trying again.`
         : "";
@@ -861,84 +786,37 @@ function App(){
   }
 
   if (!isLoggedIn) {
-    const showForm = ["login", "signup", "recovery", "forgotUsername", "reset", "upgrade", "pending", "upgrade_pending"].includes(authMode);
     const strength = passwordStrength(loginForm.password);
-    const authTitles = {
-      login: "Welcome back",
-      signup: "Create your account",
-      recovery: "Recover your account",
-      forgotUsername: "Recover your username",
-      reset: "Choose a new password",
-      verify: "Verify your email",
-      pending: "Check your inbox",
-      upgrade: "Secure your account",
-      upgrade_pending: "Verify your email"
-    };
-    const authDescriptions = {
-      login: "Sign in to your trading workspace.",
-      signup: "Start with a verified email and a strong password.",
-      recovery: "Enter your registered email address.",
-      forgotUsername: "We will email the username to its verified address.",
-      reset: "Use a unique password with at least 12 characters.",
-      verify: "Confirm your address to activate your account.",
-      pending: "Your account is ready once your email is verified.",
-      upgrade: "Add and verify an email to enable account recovery.",
-      upgrade_pending: "Confirm your email to enable account recovery."
-    };
     return (
       <div className="loginShell authShell">
         <div className="loginCard authCard">
           <div className="brand"><div className="brandIcon">AI</div><div><b>TradeMind</b><small>AI Trading Lab</small></div></div>
-          {!["login", "signup"].includes(authMode) && <div className="authEyebrow"><span /> ACCOUNT SECURITY</div>}
-          {["login", "signup"].includes(authMode) && (
-            <div className="authToggle" role="tablist" aria-label="Account access">
-              <button type="button" role="tab" aria-selected={authMode === "login"} className={authMode === "login" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button>
-              <button type="button" role="tab" aria-selected={authMode === "signup"} className={authMode === "signup" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Sign up</button>
-            </div>
-          )}
-          <h1>{authTitles[authMode] || "TradeMind account"}</h1>
-          <p className="authDescription">{authDescriptions[authMode] || "Continue securely to TradeMind."}</p>
+          <div className="authToggle" role="tablist" aria-label="Account access">
+            <button type="button" role="tab" aria-selected={authMode === "login"} className={authMode === "login" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button>
+            <button type="button" role="tab" aria-selected={authMode === "signup"} className={authMode === "signup" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Sign up</button>
+          </div>
+          <h1>{authMode === "login" ? "Welcome back" : "Create your account"}</h1>
+          <p className="authDescription">{authMode === "login" ? "Sign in to your trading workspace." : "Choose a username and secure password."}</p>
           {authMessage && <div className="authMessage" role="status"><CheckCircle2 size={17} /> <span>{authMessage}</span></div>}
-          {showForm && <form onSubmit={handleLogin} className="loginForm authForm">
+          <form onSubmit={handleLogin} className="loginForm authForm">
             {authMode === "login" && <>
-              <label>Username or email<input autoComplete="username" minLength={3} maxLength={254} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="you@example.com or username" /></label>
+              <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Your username" /></label>
               <label>Password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="current-password" minLength={8} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="Your password" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
-              <button className="authTextLink forgotLink" type="button" onClick={() => {setAuthMode("recovery"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("");}}>Forgot password?</button>
-              <button className="authTextLink forgotLink" type="button" onClick={() => {setAuthMode("forgotUsername"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("");}}>Forgot username?</button>
             </>}
             {authMode === "signup" && <>
               <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Choose a username" /></label>
-              <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={loginForm.email} onChange={(event) => setLoginForm((current) => ({...current, email: event.target.value}))} placeholder="you@example.com" /></label>
               <label>Password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
               {loginForm.password && <div className={`passwordStrength strength-${strength.score}`}><div><span style={{width: `${strength.score * 20}%`}} /></div><small>Password strength: {strength.label}</small></div>}
               <label>Confirm password<div className="authPasswordWrap"><input type={confirmPasswordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /><button type="button" aria-label={confirmPasswordVisible ? "Hide confirm password" : "Show confirm password"} onClick={() => setConfirmPasswordVisible((visible) => !visible)}>{confirmPasswordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
             </>}
-            {authMode === "recovery" && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
-            {authMode === "forgotUsername" && <label>Verified email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
-            {authMode === "reset" && <>
-              <label>New password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
-              {loginForm.password && <div className={`passwordStrength strength-${strength.score}`}><div><span style={{width: `${strength.score * 20}%`}} /></div><small>Password strength: {strength.label}</small></div>}
-              <label>Confirm new password<div className="authPasswordWrap"><input type={confirmPasswordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /><button type="button" aria-label={confirmPasswordVisible ? "Hide confirm password" : "Show confirm password"} onClick={() => setConfirmPasswordVisible((visible) => !visible)}>{confirmPasswordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
-            </>}
-            {authMode === "upgrade" && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={loginForm.email} onChange={(event) => setLoginForm((current) => ({...current, email: event.target.value}))} placeholder="you@example.com" /></label>}
-            {["pending", "upgrade_pending"].includes(authMode) && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
             {loginError && <div className="loginError" role="alert">{loginError}</div>}
             <button className="primary full authSubmit" type="submit" disabled={authBusy}>
-              {authBusy ? <span className="authSpinner" aria-hidden="true" /> : authMode === "login" ? <LogIn size={16} /> : authMode === "recovery" ? <Mail size={16} /> : authMode === "reset" ? <KeyRound size={16} /> : <CheckCircle2 size={16} />}
-              {authBusy ? "Please wait…" : authMode === "login" ? "Log in" : authMode === "signup" ? "Create account" : authMode === "recovery" ? "Send reset link" : authMode === "forgotUsername" ? "Send username reminder" : authMode === "reset" ? "Reset password" : authMode === "upgrade" ? "Send verification link" : "Resend verification email"}
+              {authBusy ? <span className="authSpinner" aria-hidden="true" /> : <LogIn size={16} />}
+              {authBusy ? "Please wait…" : authMode === "login" ? "Log in" : "Create account"}
             </button>
-          </form>}
-          {!showForm && <>
-            {loginError && <div className="loginError" role="alert">{loginError}</div>}
-            <button className="primary full authSubmit" type="button" onClick={handleLogin} disabled={authBusy}>
-              {authBusy ? <span className="authSpinner" aria-hidden="true" /> : authMode === "verify" ? <Mail size={16} /> : <CheckCircle2 size={16} />}
-              {authBusy ? "Please wait…" : authMode === "verify" ? "Verify email" : "Send another verification email"}
-            </button>
-            {authMode === "verify" && <button className="authTextLink authResendLink" type="button" onClick={() => {setAuthMode("pending"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("Enter your email address to request another verification link.");}}>Request another verification email</button>}
-          </>}
+          </form>
           {authMode === "login" && <p className="authFooter">New to TradeMind? <button type="button" className="authTextLink" onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Create an account</button></p>}
           {authMode === "signup" && <p className="authFooter">Already registered? <button type="button" className="authTextLink" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button></p>}
-          {["recovery", "forgotUsername", "reset", "verify", "pending", "upgrade", "upgrade_pending"].includes(authMode) && <button className="authBack" type="button" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}><ArrowLeft size={15} /> Back to login</button>}
         </div>
       </div>
     );

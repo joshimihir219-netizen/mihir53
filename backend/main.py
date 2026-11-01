@@ -68,17 +68,17 @@ EMAIL_VERIFICATION_LIFETIME = timedelta(hours=24)
 PASSWORD_RESET_LIFETIME = timedelta(hours=1)
 AUTH_RATE_WINDOW = timedelta(minutes=15)
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+AUTH_EMAIL_ROUTES_ENABLED = False
 
 
 class SignupPayload(BaseModel):
     username: str = Field(min_length=3, max_length=50)
-    email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=12, max_length=128)
     confirm_password: str = Field(min_length=12, max_length=128)
 
 
 class LoginPayload(BaseModel):
-    username_or_email: str = Field(min_length=3, max_length=254)
+    username: str = Field(min_length=3, max_length=50)
     password: str = Field(min_length=8, max_length=128)
 
 
@@ -369,8 +369,6 @@ def _rate_limit(
     now = datetime.now(timezone.utc)
     with _auth_connection() as connection:
         _execute(connection, "DELETE FROM auth_rate_limits WHERE reset_at <= ?", (now.isoformat(),))
-        token_retention_cutoff = (now - timedelta(days=1)).isoformat()
-        _execute(connection, "DELETE FROM auth_tokens WHERE expires_at <= ? OR consumed_at <= ?", (now.isoformat(), token_retention_cutoff))
         exceeded = False
         retry_after = int(AUTH_RATE_WINDOW.total_seconds())
         for bucket, bucket_limit, bucket_window in buckets:
@@ -510,61 +508,53 @@ def _session_token(authorization: str | None) -> str:
 
 @app.post("/api/auth/signup", status_code=201)
 def signup(payload: SignupPayload, request: Request):
-    _rate_limit(request, "signup", 5, payload.email)
     if payload.password != payload.confirm_password:
         raise HTTPException(status_code=422, detail="Passwords do not match.")
     username = payload.username.strip()
     if len(username) < 3:
         raise HTTPException(status_code=422, detail="Username must contain at least 3 characters.")
-    email = _normalized_email(payload.email)
+    _rate_limit(request, "signup", 5, username)
     salt = secrets.token_bytes(16)
     password_hash = _hash_password(payload.password, salt)
     try:
         with _auth_connection() as connection:
             if _execute(connection, "SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
                 raise HTTPException(status_code=409, detail="This username is already taken. Please choose another username.")
-            if _execute(connection, "SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone():
-                raise HTTPException(status_code=409, detail="This email is already registered. Please log in or reset your password.")
             created_at = datetime.now(timezone.utc).isoformat()
             if DATABASE_URL:
                 cursor = _execute(
                     connection,
-                    "INSERT INTO users (username, email, email_verified, password_salt, password_hash, created_at, password_updated_at) VALUES (?, ?, FALSE, ?, ?, ?, ?) RETURNING id",
-                    (username, email, salt, password_hash, created_at, created_at),
+                    "INSERT INTO users (username, password_salt, password_hash, created_at, password_updated_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    (username, salt, password_hash, created_at, created_at),
                 )
                 user_id = int(cursor.fetchone()["id"])
             else:
                 cursor = _execute(
                     connection,
-                    "INSERT INTO users (username, email, email_verified, password_salt, password_hash, created_at, password_updated_at) VALUES (?, ?, 0, ?, ?, ?, ?)",
-                    (username, email, salt, password_hash, created_at, created_at),
+                    "INSERT INTO users (username, password_salt, password_hash, created_at, password_updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (username, salt, password_hash, created_at, created_at),
                 )
                 user_id = int(cursor.lastrowid)
-            token = _create_auth_token(connection, user_id, "verify_email", EMAIL_VERIFICATION_LIFETIME)
     except (sqlite3.IntegrityError, psycopg.IntegrityError) as error:
-        if "email" in str(error).lower():
-            raise HTTPException(status_code=409, detail="This email is already registered. Please log in or reset your password.") from error
         raise HTTPException(status_code=409, detail="This username is already taken. Please choose another username.") from error
-    _send_verification_email(email, token)
-    return {"message": "Account created. Check your email for a verification link before logging in."}
+    return {"message": "Account created. You can now log in."}
 
 
 @app.post("/api/auth/login")
 def login(payload: LoginPayload, request: Request, response: Response):
-    identifier = payload.username_or_email.strip()
-    _rate_limit(request, "login", 10, identifier)
+    username = payload.username.strip()
+    _rate_limit(request, "login", 10, username)
     with _auth_connection() as connection:
-        if "@" in identifier:
-            user = _execute(connection, "SELECT id, username, email, email_verified, password_salt, password_hash FROM users WHERE LOWER(email) = LOWER(?)", (identifier,)).fetchone()
-        else:
-            user = _execute(connection, "SELECT id, username, email, email_verified, password_salt, password_hash FROM users WHERE LOWER(username) = LOWER(?)", (identifier,)).fetchone()
+        user = _execute(
+            connection,
+            "SELECT id, username, password_salt, password_hash FROM users WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        ).fetchone()
         if user is None or not hmac.compare_digest(
             _hash_password(payload.password, user["password_salt"]),
             user["password_hash"],
         ):
-            raise HTTPException(status_code=401, detail="Unable to log in. Verify your email if needed, or check your credentials.")
-        if user["email"] and not user["email_verified"]:
-            return JSONResponse(status_code=403, content={"detail": "Email verification is required. Request another verification email to continue.", "code": "email_unverified"})
+            raise HTTPException(status_code=401, detail="Username or password is incorrect.")
         token = _new_session(connection, int(user["id"]))
     _set_session_cookie(response, request, token)
     return {"username": user["username"]}
@@ -579,7 +569,7 @@ def current_user(request: Request, response: Response, authorization: str | None
         user = _execute(
             connection,
             """
-            SELECT users.username, users.email, users.email_verified, auth_sessions.expires_at
+            SELECT users.username, auth_sessions.expires_at
             FROM auth_sessions JOIN users ON users.id = auth_sessions.user_id
             WHERE auth_sessions.token_hash = ?
             """,
@@ -590,15 +580,9 @@ def current_user(request: Request, response: Response, authorization: str | None
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
     if not request.cookies.get("trademind_session") and authorization:
         _set_session_cookie(response, request, token)
-    return {
-        "username": user["username"],
-        "email": user["email"],
-        "email_verified": bool(user["email_verified"]),
-        "requires_email_upgrade": not user["email"] or not user["email_verified"],
-    }
+    return {"username": user["username"]}
 
 
-@app.post("/api/auth/verify-email")
 def verify_email(payload: TokenPayload, request: Request):
     _rate_limit(request, "verify_email", 10, payload.token)
     token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
@@ -614,7 +598,6 @@ def verify_email(payload: TokenPayload, request: Request):
     return {"message": "Email verified. You can now log in to TradeMind."}
 
 
-@app.post("/api/auth/resend-verification")
 def resend_verification(payload: EmailPayload, request: Request):
     _rate_limit(
         request,
@@ -635,7 +618,6 @@ def resend_verification(payload: EmailPayload, request: Request):
     return {"message": "If this account needs verification, a new link will be sent shortly."}
 
 
-@app.post("/api/auth/upgrade-email")
 def upgrade_email(payload: EmailPayload, request: Request, authorization: str | None = Header(default=None)):
     _rate_limit(request, "upgrade_email", 5, payload.email)
     email = _normalized_email(payload.email)
@@ -653,7 +635,6 @@ def upgrade_email(payload: EmailPayload, request: Request, authorization: str | 
     return {"message": "Verification email sent. Confirm the address to enable email recovery."}
 
 
-@app.post("/api/auth/forgot-password", status_code=202)
 def forgot_password(payload: EmailPayload, request: Request):
     _rate_limit(request, "forgot_password", 5, payload.email)
     email = _normalized_email(payload.email)
@@ -670,7 +651,6 @@ def forgot_password(payload: EmailPayload, request: Request):
     return {"message": "If an account exists for this email, you will receive a password reset link shortly."}
 
 
-@app.post("/api/auth/forgot-username", status_code=202)
 def forgot_username(payload: EmailPayload, request: Request):
     _rate_limit(request, "forgot_username", 5, payload.email)
     email = _normalized_email(payload.email)
@@ -696,7 +676,6 @@ def forgot_username(payload: EmailPayload, request: Request):
     return {"message": "If a verified account exists for this email, its username will be sent shortly."}
 
 
-@app.post("/api/auth/reset-password")
 def reset_password(payload: PasswordResetPayload, request: Request, response: Response):
     _rate_limit(request, "reset_password", 10, payload.token)
     if payload.password != payload.confirm_password:
@@ -716,6 +695,15 @@ def reset_password(payload: PasswordResetPayload, request: Request, response: Re
         _execute(connection, "DELETE FROM auth_sessions WHERE user_id = ?", (int(token["user_id"]),))
     response.delete_cookie("trademind_session", path="/", httponly=True, secure=request.url.scheme == "https" or bool(os.environ.get("VERCEL")), samesite="lax")
     return {"message": "Password updated. Log in with your new password."}
+
+
+if AUTH_EMAIL_ROUTES_ENABLED:
+    app.add_api_route("/api/auth/verify-email", verify_email, methods=["POST"])
+    app.add_api_route("/api/auth/resend-verification", resend_verification, methods=["POST"])
+    app.add_api_route("/api/auth/upgrade-email", upgrade_email, methods=["POST"])
+    app.add_api_route("/api/auth/forgot-password", forgot_password, methods=["POST"], status_code=202)
+    app.add_api_route("/api/auth/forgot-username", forgot_username, methods=["POST"], status_code=202)
+    app.add_api_route("/api/auth/reset-password", reset_password, methods=["POST"])
 
 
 def _authenticated_user_id(authorization: str | None) -> int:

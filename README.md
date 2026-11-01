@@ -79,25 +79,13 @@ npm run dev
 ```
 
 ## Accounts
-TradeMind uses its existing FastAPI authentication service, not a hosted identity provider. Passwords are stored as salted PBKDF2-SHA256 hashes; sessions are opaque server-side tokens sent in HttpOnly cookies. Registration requires a unique username and email, and sign-in is enabled after email verification. Reset tokens are single-use, time-limited, and stored only as hashes. New auth tables and nullable user email fields are applied in place at backend startup; existing account IDs, hashes, sessions, and dashboard data are preserved. Existing users without email are prompted to add and verify one before email recovery is available.
+TradeMind temporarily uses username and password authentication only. Signup requires a unique username, password, and confirmation; passwords remain salted PBKDF2-SHA256 hashes. Sessions are opaque server-side tokens sent in HttpOnly cookies, with login/signup throttling and server-side logout revocation. Email verification, password reset, username recovery, and their API routes are disabled during this temporary mode. No email provider credentials are needed.
 
-Email is delivered through Resend. Verify the sending domain in Resend, then configure these variables in the backend environment (for Vercel, **Settings → Environment Variables**):
+Existing accounts and dashboard data are preserved. Existing `email`, `email_verified`, and auth-token schema fields are intentionally retained but are not read or written by username authentication; new accounts leave email fields empty. The case-insensitive database username constraint remains active. Existing browser sessions continue through the server-side cookie/bearer compatibility check.
 
-```dotenv
-DATABASE_URL=your-postgresql-connection-string
-RESEND_API_KEY=your-resend-api-key
-EMAIL_FROM=accounts@your-verified-domain.com
-EMAIL_FROM_NAME=TradeMind
-APP_BASE_URL=https://your-production-domain.com
-```
+For Vercel, configure a persistent PostgreSQL connection as `DATABASE_URL` (the backend also recognizes `POSTGRES_URL` and `POSTGRES_URL_NON_POOLING`) in **Settings → Environment Variables**. No Resend, sender, or email-link variables are required while email auth is disabled. After deployment, `/api/health` should report `database: "postgresql"` and `persistent_storage: true`. Local accounts use SQLite at `backend/trademind-auth.sqlite3` by default; `TRADEMIND_AUTH_DB` selects another path.
 
-`DATABASE_URL` is required for persistent Vercel accounts. The backend also recognizes `POSTGRES_URL` and `POSTGRES_URL_NON_POOLING`. `APP_BASE_URL` should be the public frontend origin used in email links; Vercel's deployment URL is used as a fallback, but setting the production domain explicitly is recommended. `FRONTEND_ORIGINS` is optional and only needed for a separate frontend origin; provide comma-separated allowed origins. Do not put these secrets in frontend variables or source control. Configure them for Production (and Preview if desired), then redeploy. Verify `/api/health` reports `database: "postgresql"` and `persistent_storage: true`; production email credentials and domain status must also be checked in the Vercel and Resend dashboards.
-
-For local development, email links default to `http://localhost:5173`; set the Resend variables in the backend's ignored `.env` file to test actual delivery. The sender address still has to be verified with Resend. Without email configuration, registration and email delivery return an explicit service error rather than claiming an email was sent. Local accounts use SQLite at `backend/trademind-auth.sqlite3` by default; set `TRADEMIND_AUTH_DB` to choose another path. A browser session created by an older TradeMind version is migrated to an HttpOnly cookie at its next successful session check, then its local token is removed.
-
-To test the flow, create a fresh account with a unique email, verify the link, and log in with either username or email. Try duplicate username/email and invalid/mismatched signup values. Use **Forgot password?** and **Forgot username?** with verified and unverified addresses; follow a reset link, set a new password, and confirm the old password and a reused/expired reset link fail. Repeat signup/reset requests to confirm throttling. Verification resend is limited to one message per email per 60 seconds. To test delivery failure, temporarily use an invalid Resend key and confirm signup stays pending and offers resend; restore valid credentials afterward. Existing users without an email should sign in and complete the prompted email verification step.
-
-Run the backend regression suite from `backend/` with `python -m unittest test_auth test_backtest` after installing `requirements.txt`. The auth tests use temporary SQLite databases and mock Resend, so they do not modify local accounts or send email.
+Run the backend regression suite from `backend/` with `python -m unittest test_auth test_backtest` after installing `requirements.txt`. Tests use temporary SQLite databases and do not modify existing accounts.
 
 ## Telegram signal alerts
 After signing in, open the profile settings and enter a Telegram bot token and chat ID, then use **Test Telegram connection** to confirm delivery. Create the bot with Telegram's BotFather and send it `/start` from the target chat before testing; a bot cannot start a private chat on its own. Signal alerts are sent by the backend through the Telegram Bot API when the selected signal changes. Keep the dashboard open and signed in to receive automatic alerts. Telegram settings are stored in this browser, so only save a bot token on a device you trust.

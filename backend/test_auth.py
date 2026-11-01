@@ -2,11 +2,10 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 import psycopg
 
@@ -31,173 +30,96 @@ class AuthenticationFlowTests(unittest.TestCase):
         main.AUTH_DB = Path(self.directory.name) / "auth.sqlite3"
         main._initialize_auth_db()
         self.client = TestClient(main.app)
-        self.verify_email = patch.object(main, "_send_verification_email").start()
-        self.reset_email = patch.object(main, "_send_password_reset_email").start()
-        self.addCleanup(patch.stopall)
         self.addCleanup(self.client.close)
         self.addCleanup(self.directory.cleanup)
 
-    def register(self, username="marketpilot", email="pilot@example.com", password="MarketPilot!42", confirm_password=None):
+    def register(self, username="marketpilot", password="MarketPilot!42", confirm_password=None):
         return self.client.post("/api/auth/signup", json={
             "username": username,
-            "email": email,
             "password": password,
             "confirm_password": confirm_password or password,
         })
 
-    def verification_token(self):
-        return self.verify_email.call_args.args[1]
-
-    def test_registration_requires_verification_and_accepts_email_login(self):
+    def test_registration_hashes_password_and_login_works_without_email(self):
         response = self.register()
         self.assertEqual(response.status_code, 201)
-        self.assertNotIn("access_token", response.json())
+        self.assertEqual(response.json()["message"], "Account created. You can now log in.")
         self.assertFalse(response.cookies.get("trademind_session"))
         with main._auth_connection() as connection:
-            user = main._execute(connection, "SELECT password_hash FROM users WHERE username = ?", ("marketpilot",)).fetchone()
+            user = main._execute(
+                connection,
+                "SELECT id, username, email, email_verified, password_hash FROM users WHERE username = ?",
+                ("marketpilot",),
+            ).fetchone()
+        self.assertEqual(user["email"], None)
+        self.assertFalse(user["email_verified"])
         self.assertNotEqual(user["password_hash"], b"MarketPilot!42")
         self.assertIsInstance(user["password_hash"], bytes)
-        unverified_login = self.client.post("/api/auth/login", json={
-            "username_or_email": "marketpilot",
-            "password": "MarketPilot!42",
-        })
-        self.assertEqual(unverified_login.status_code, 403)
-        self.assertEqual(unverified_login.json()["code"], "email_unverified")
 
-        verified = self.client.post("/api/auth/verify-email", json={"token": self.verification_token()})
-        self.assertEqual(verified.status_code, 200)
         login = self.client.post("/api/auth/login", json={
-            "username_or_email": "pilot@example.com",
+            "username": "marketpilot",
             "password": "MarketPilot!42",
         })
         self.assertEqual(login.status_code, 200)
         self.assertIn("httponly", login.headers["set-cookie"].lower())
-        self.assertNotIn("access_token", login.json())
+        self.assertEqual(self.client.get("/api/auth/me").json(), {"username": "marketpilot"})
 
-    def test_duplicate_username_email_and_invalid_email_are_rejected(self):
+    def test_duplicate_username_is_rejected_case_insensitively(self):
         self.assertEqual(self.register().status_code, 201)
-        duplicate_username = self.register(username="MarketPilot", email="another@example.com")
-        self.assertEqual(duplicate_username.status_code, 409)
-        self.assertEqual(duplicate_username.json()["detail"], "This username is already taken. Please choose another username.")
-        duplicate_email = self.register(username="anotherpilot", email="PILOT@example.com")
-        self.assertEqual(duplicate_email.status_code, 409)
-        self.assertEqual(duplicate_email.json()["detail"], "This email is already registered. Please log in or reset your password.")
-        invalid_email = self.register(username="thirdpilot", email="not-an-email")
-        self.assertEqual(invalid_email.status_code, 422)
+        duplicate = self.register(username="MarketPilot")
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.json()["detail"], "This username is already taken. Please choose another username.")
+        with main._auth_connection() as connection:
+            count = main._execute(connection, "SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+        self.assertEqual(int(count), 1)
 
-    def test_password_mismatch_is_rejected_by_server(self):
-        signup = self.register(confirm_password="DifferentPassword!87")
-        self.assertEqual(signup.status_code, 422)
-        self.assertIn("do not match", signup.json()["detail"])
+    def test_password_mismatch_does_not_create_user(self):
+        response = self.register(confirm_password="DifferentPassword!87")
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"], "Passwords do not match.")
+        with main._auth_connection() as connection:
+            count = main._execute(connection, "SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+        self.assertEqual(int(count), 0)
 
-    def test_unverified_login_returns_resend_guidance_without_session(self):
+    def test_incorrect_password_is_rejected_without_session(self):
         self.assertEqual(self.register().status_code, 201)
         response = self.client.post("/api/auth/login", json={
-            "username_or_email": "marketpilot",
-            "password": "MarketPilot!42",
+            "username": "marketpilot",
+            "password": "IncorrectPassword!42",
         })
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["code"], "email_unverified")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "Username or password is incorrect.")
         self.assertFalse(self.client.cookies.get("trademind_session"))
 
-    def test_protected_legacy_callers_return_json_unauthorized(self):
-        client = TestClient(main.app, raise_server_exceptions=False)
-        telegram = client.post("/api/telegram/send", json={
-            "bot_token": "123456:example-token",
-            "chat_id": "123",
-            "message": "test",
-        })
-        options = client.get("/api/options/signal/NIFTY")
-        self.assertEqual(telegram.status_code, 401)
-        self.assertEqual(telegram.headers.get("content-type", "").split(";")[0], "application/json")
-        self.assertEqual(options.status_code, 401)
-        self.assertEqual(options.headers.get("content-type", "").split(";")[0], "application/json")
-        client.close()
-
-    def test_verification_can_be_resent_and_old_link_is_invalidated(self):
+    def test_session_persists_across_client_instances(self):
         self.assertEqual(self.register().status_code, 201)
-        first_token = self.verification_token()
-        resent = self.client.post("/api/auth/resend-verification", json={"email": "pilot@example.com"})
-        self.assertEqual(resent.status_code, 200)
-        second_token = self.verification_token()
-        self.assertNotEqual(first_token, second_token)
-        cooldown = self.client.post("/api/auth/resend-verification", json={"email": "pilot@example.com"})
-        self.assertEqual(cooldown.status_code, 429)
-        self.assertEqual(self.client.post("/api/auth/verify-email", json={"token": first_token}).status_code, 400)
-        self.assertEqual(self.client.post("/api/auth/verify-email", json={"token": second_token}).status_code, 200)
-
-    def test_username_recovery_only_sends_to_verified_email_and_is_neutral(self):
-        self.assertEqual(self.register().status_code, 201)
-        with patch.object(main, "_send_auth_email") as send_email:
-            pending = self.client.post("/api/auth/forgot-username", json={"email": "pilot@example.com"})
-            self.assertEqual(pending.status_code, 202)
-            self.assertFalse(send_email.called)
-
-            self.client.post("/api/auth/verify-email", json={"token": self.verification_token()})
-            recovered = self.client.post("/api/auth/forgot-username", json={"email": "PILOT@example.com"})
-            self.assertEqual(recovered.status_code, 202)
-            self.assertEqual(recovered.json()["message"], pending.json()["message"])
-            self.assertEqual(send_email.call_args.args[0], "pilot@example.com")
-            self.assertIn("marketpilot", send_email.call_args.args[3])
-
-    def test_reset_is_single_use_and_invalidates_sessions_and_old_password(self):
-        self.assertEqual(self.register().status_code, 201)
-        self.client.post("/api/auth/verify-email", json={"token": self.verification_token()})
-        self.assertEqual(self.client.post("/api/auth/login", json={
-            "username_or_email": "marketpilot",
+        self.client.post("/api/auth/login", json={
+            "username": "marketpilot",
             "password": "MarketPilot!42",
-        }).status_code, 200)
-        previous_session = self.client.cookies.get("trademind_session")
-
-        requested = self.client.post("/api/auth/forgot-password", json={"email": "pilot@example.com"})
-        self.assertEqual(requested.status_code, 202)
-        reset_token = self.reset_email.call_args.args[1]
-        mismatch = self.client.post("/api/auth/reset-password", json={
-            "token": reset_token,
-            "password": "NewMarketPilot!87",
-            "confirm_password": "DifferentMarketPilot!88",
         })
-        self.assertEqual(mismatch.status_code, 422)
-        reset = self.client.post("/api/auth/reset-password", json={
-            "token": reset_token,
-            "password": "NewMarketPilot!87",
-            "confirm_password": "NewMarketPilot!87",
-        })
-        self.assertEqual(reset.status_code, 200)
-        self.assertIn("trademind_session", reset.headers.get("set-cookie", ""))
-        invalidated_session = self.client.get("/api/auth/me", headers={"Authorization": f"Bearer {previous_session}"})
-        self.assertEqual(invalidated_session.status_code, 401)
-        self.assertEqual(self.client.post("/api/auth/reset-password", json={
-            "token": reset_token,
-            "password": "AnotherMarketPilot!98",
-            "confirm_password": "AnotherMarketPilot!98",
-        }).status_code, 400)
-        self.assertEqual(self.client.post("/api/auth/login", json={
-            "username_or_email": "marketpilot",
-            "password": "MarketPilot!42",
-        }).status_code, 401)
-        self.assertEqual(self.client.post("/api/auth/login", json={
-            "username_or_email": "marketpilot",
-            "password": "NewMarketPilot!87",
-        }).status_code, 200)
+        second_client = TestClient(main.app, cookies=dict(self.client.cookies))
+        try:
+            response = second_client.get("/api/auth/me")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["username"], "marketpilot")
+        finally:
+            second_client.close()
 
-    def test_expired_reset_token_is_rejected(self):
+    def test_logout_revokes_persistent_session(self):
         self.assertEqual(self.register().status_code, 201)
-        self.client.post("/api/auth/verify-email", json={"token": self.verification_token()})
-        self.client.post("/api/auth/forgot-password", json={"email": "pilot@example.com"})
-        reset_token = self.reset_email.call_args.args[1]
-        token_hash = main.hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
-        expired_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-        with main._auth_connection() as connection:
-            main._execute(connection, "UPDATE auth_tokens SET expires_at = ? WHERE token_hash = ?", (expired_at, token_hash))
-        response = self.client.post("/api/auth/reset-password", json={
-            "token": reset_token,
-            "password": "NewMarketPilot!87",
-            "confirm_password": "NewMarketPilot!87",
+        self.client.post("/api/auth/login", json={
+            "username": "marketpilot",
+            "password": "MarketPilot!42",
         })
-        self.assertEqual(response.status_code, 400)
+        session_token = self.client.cookies.get("trademind_session")
+        self.assertTrue(session_token)
+        logout = self.client.post("/api/auth/logout")
+        self.assertEqual(logout.status_code, 204)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        revoked = self.client.get("/api/auth/me", headers={"Authorization": f"Bearer {session_token}"})
+        self.assertEqual(revoked.status_code, 401)
 
-    def test_legacy_account_is_preserved_and_can_upgrade_email(self):
+    def test_legacy_user_and_email_data_are_preserved_but_do_not_gate_login(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
         salt = b"0123456789abcdef"
         connection = sqlite3.connect(legacy_path)
@@ -206,14 +128,17 @@ class AuthenticationFlowTests(unittest.TestCase):
                 CREATE TABLE users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    email TEXT,
+                    email_verified INTEGER NOT NULL DEFAULT 0,
                     password_salt BLOB NOT NULL,
                     password_hash BLOB NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    password_updated_at TEXT
                 )
             """)
             connection.execute(
-                "INSERT INTO users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
-                ("oldaccount", salt, main._hash_password("OldAccount!42", salt), datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO users (username, email, email_verified, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("oldaccount", "old@example.com", 0, salt, main._hash_password("OldAccount!42", salt), datetime.now(timezone.utc).isoformat()),
             )
             connection.commit()
         finally:
@@ -221,73 +146,38 @@ class AuthenticationFlowTests(unittest.TestCase):
         main.AUTH_DB = legacy_path
         main._initialize_auth_db()
         login = self.client.post("/api/auth/login", json={
-            "username_or_email": "oldaccount",
+            "username": "oldaccount",
             "password": "OldAccount!42",
         })
         self.assertEqual(login.status_code, 200)
-        self.assertTrue(self.client.get("/api/auth/me").json()["requires_email_upgrade"])
-        upgraded = self.client.post("/api/auth/upgrade-email", json={"email": "legacy@example.com"})
-        self.assertEqual(upgraded.status_code, 200)
-        self.assertEqual(self.verify_email.call_args.args[0], "legacy@example.com")
-        verified = self.client.post("/api/auth/verify-email", json={"token": self.verification_token()})
-        self.assertEqual(verified.status_code, 200)
-        self.assertFalse(self.client.get("/api/auth/me").json()["requires_email_upgrade"])
         with main._auth_connection() as connection:
-            user = main._execute(connection, "SELECT id, email_verified FROM users WHERE username = ?", ("oldaccount",)).fetchone()
+            user = main._execute(connection, "SELECT id, email, email_verified FROM users WHERE username = ?", ("oldaccount",)).fetchone()
         self.assertEqual(int(user["id"]), 1)
-        self.assertTrue(user["email_verified"])
+        self.assertEqual(user["email"], "old@example.com")
+        self.assertEqual(user["email_verified"], 0)
 
-    def test_forgot_password_is_neutral_for_unknown_email_and_rate_limited(self):
-        first = self.client.post("/api/auth/forgot-password", json={"email": "nobody@example.com"})
-        self.assertEqual(first.status_code, 202)
-        self.assertIn("If an account exists", first.json()["message"])
-        self.assertFalse(self.reset_email.called)
-        for attempt in range(4):
-            response = self.client.post(
-                "/api/auth/forgot-password",
-                json={"email": "nobody@example.com"},
-                headers={"X-Forwarded-For": f"198.51.100.{attempt + 1}"},
-            )
-            self.assertEqual(response.status_code, 202)
-        limited = self.client.post(
-            "/api/auth/forgot-password",
-            json={"email": "nobody@example.com"},
-            headers={"X-Forwarded-For": "198.51.100.5"},
-        )
-        self.assertEqual(limited.status_code, 429)
+    def test_email_auth_routes_are_not_registered(self):
+        routes = {route.path for route in main.app.routes}
+        self.assertFalse(any(path.startswith("/api/auth/verify-") for path in routes))
+        self.assertFalse(any("password" in path or "username" in path and "auth" in path for path in routes if path != "/api/auth/login"))
 
-    def test_password_reset_delivery_failure_does_not_reveal_account_existence(self):
-        unknown = self.client.post("/api/auth/forgot-password", json={"email": "nobody@example.com"})
-        self.assertEqual(self.register().status_code, 201)
-        self.client.post("/api/auth/verify-email", json={"token": self.verification_token()})
-        self.reset_email.side_effect = HTTPException(status_code=502, detail="Provider failure")
-        with self.assertLogs("trademind.auth", level="WARNING"):
-            existing = self.client.post("/api/auth/forgot-password", json={"email": "pilot@example.com"})
-        self.assertEqual(existing.status_code, 202)
-        self.assertEqual(existing.json(), unknown.json())
-
-    def test_email_provider_failure_is_reported(self):
-        self.verify_email.side_effect = HTTPException(status_code=502, detail="TradeMind could not deliver the email.")
-        response = self.register()
-        self.assertEqual(response.status_code, 502)
-        with main._auth_connection() as connection:
-            user = main._execute(connection, "SELECT id FROM users WHERE username = ?", ("marketpilot",)).fetchone()
-        self.assertIsNotNone(user)
-        self.verify_email.side_effect = None
-        resend = self.client.post("/api/auth/resend-verification", json={"email": "pilot@example.com"})
-        self.assertEqual(resend.status_code, 200)
-        duplicate = self.register()
-        self.assertEqual(duplicate.status_code, 409)
-        with main._auth_connection() as connection:
-            count = main._execute(connection, "SELECT COUNT(*) AS count FROM users WHERE email = ?", ("pilot@example.com",)).fetchone()["count"]
-        self.assertEqual(int(count), 1)
+    def test_protected_legacy_callers_return_json_unauthorized(self):
+        telegram = self.client.post("/api/telegram/send", json={
+            "bot_token": "123456:example-token",
+            "chat_id": "123",
+            "message": "test",
+        })
+        options = self.client.get("/api/options/signal/NIFTY")
+        self.assertEqual(telegram.status_code, 401)
+        self.assertEqual(telegram.headers.get("content-type", "").split(";")[0], "application/json")
+        self.assertEqual(options.status_code, 401)
+        self.assertEqual(options.headers.get("content-type", "").split(";")[0], "application/json")
 
     def test_database_failures_return_safe_json(self):
         with self.assertLogs("trademind.auth", level="ERROR"):
             with patch.object(main, "_auth_connection", side_effect=psycopg.OperationalError("private connection detail")):
                 response = self.client.post("/api/auth/signup", json={
                     "username": "marketpilot",
-                    "email": "pilot@example.com",
                     "password": "MarketPilot!42",
                     "confirm_password": "MarketPilot!42",
                 })
