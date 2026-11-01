@@ -4,6 +4,7 @@ import hashlib
 import hmac
 from html import escape as escape_html
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
 import psycopg
 from psycopg.rows import dict_row
@@ -26,6 +28,7 @@ from market_data import TIMEFRAME_HISTORY, market_frame, _duration_offset, _max_
 from angel_options import get_live_option_signal
 
 app = FastAPI(title="AI Trading Dashboard API", version="2.0.0")
+logger = logging.getLogger("trademind.auth")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(",") if origin.strip()],
@@ -33,6 +36,19 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.exception_handler(sqlite3.Error)
+@app.exception_handler(psycopg.Error)
+async def database_error_response(request: Request, error: Exception):
+    logger.exception("Database operation failed method=%s path=%s", request.method, request.url.path)
+    return JSONResponse(status_code=503, content={"detail": "Account service is temporarily unavailable. Please try again."})
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_response(request: Request, error: Exception):
+    logger.exception("Unhandled API error method=%s path=%s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "The account service encountered an error. Please try again."})
 
 SYMBOLS = [
     "NIFTY 50", "BANK NIFTY", "SENSEX",
@@ -331,22 +347,34 @@ def _normalized_email(value: str) -> str:
     return email
 
 
-def _rate_limit(request: Request, action: str, limit: int, subject: str | None = None):
+def _rate_limit(
+    request: Request,
+    action: str,
+    limit: int,
+    subject: str | None = None,
+    subject_limit: int | None = None,
+    subject_window: timedelta | None = None,
+):
     address = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
     if not address:
         address = request.client.host if request.client else "unknown"
-    buckets = [hashlib.sha256(f"{action}:address:{address}".encode("utf-8")).hexdigest()]
+    buckets = [(hashlib.sha256(f"{action}:address:{address}".encode("utf-8")).hexdigest(), limit, AUTH_RATE_WINDOW)]
     if subject:
         normalized_subject = subject.strip().casefold()
-        buckets.append(hashlib.sha256(f"{action}:subject:{normalized_subject}".encode("utf-8")).hexdigest())
+        buckets.append((
+            hashlib.sha256(f"{action}:subject:{normalized_subject}".encode("utf-8")).hexdigest(),
+            subject_limit or limit,
+            subject_window or AUTH_RATE_WINDOW,
+        ))
     now = datetime.now(timezone.utc)
-    reset_at = (now + AUTH_RATE_WINDOW).isoformat()
     with _auth_connection() as connection:
         _execute(connection, "DELETE FROM auth_rate_limits WHERE reset_at <= ?", (now.isoformat(),))
         token_retention_cutoff = (now - timedelta(days=1)).isoformat()
         _execute(connection, "DELETE FROM auth_tokens WHERE expires_at <= ? OR consumed_at <= ?", (now.isoformat(), token_retention_cutoff))
         exceeded = False
-        for bucket in buckets:
+        retry_after = int(AUTH_RATE_WINDOW.total_seconds())
+        for bucket, bucket_limit, bucket_window in buckets:
+            reset_at = (now + bucket_window).isoformat()
             row = _execute(
                 connection,
                 """
@@ -359,9 +387,11 @@ def _rate_limit(request: Request, action: str, limit: int, subject: str | None =
                 """,
                 (bucket, reset_at, now.isoformat(), now.isoformat(), reset_at),
             ).fetchone()
-            exceeded = exceeded or int(row["attempts"]) > limit
+            if int(row["attempts"]) > bucket_limit:
+                exceeded = True
+                retry_after = max(1, int(bucket_window.total_seconds()))
     if exceeded:
-        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes and try again.", headers={"Retry-After": str(int(AUTH_RATE_WINDOW.total_seconds()))})
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes and try again.", headers={"Retry-After": str(retry_after)})
 
 
 def _create_auth_token(connection, user_id: int, purpose: str, lifetime: timedelta) -> str:
@@ -411,8 +441,10 @@ def _send_auth_email(recipient: str, subject: str, title: str, body: str, action
         with urlopen(request, timeout=10) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
+        logger.warning("Transactional email provider returned HTTP %s", error.code)
         raise HTTPException(status_code=502, detail="TradeMind could not deliver the email. Please try again later.") from error
     except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        logger.warning("Transactional email delivery failed error_type=%s", type(error).__name__)
         raise HTTPException(status_code=502, detail="TradeMind could not deliver the email. Please try again later.") from error
     if not isinstance(result, dict) or not result.get("id"):
         raise HTTPException(status_code=502, detail="The email provider did not confirm delivery. Please try again later.")
@@ -490,9 +522,9 @@ def signup(payload: SignupPayload, request: Request):
     try:
         with _auth_connection() as connection:
             if _execute(connection, "SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
-                raise HTTPException(status_code=409, detail="That username is already taken. Choose another username.")
+                raise HTTPException(status_code=409, detail="This username is already taken. Please choose another username.")
             if _execute(connection, "SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone():
-                raise HTTPException(status_code=409, detail="That email is already registered. Log in or reset your password.")
+                raise HTTPException(status_code=409, detail="This email is already registered. Please log in or reset your password.")
             created_at = datetime.now(timezone.utc).isoformat()
             if DATABASE_URL:
                 cursor = _execute(
@@ -511,8 +543,8 @@ def signup(payload: SignupPayload, request: Request):
             token = _create_auth_token(connection, user_id, "verify_email", EMAIL_VERIFICATION_LIFETIME)
     except (sqlite3.IntegrityError, psycopg.IntegrityError) as error:
         if "email" in str(error).lower():
-            raise HTTPException(status_code=409, detail="That email is already registered. Log in or reset your password.") from error
-        raise HTTPException(status_code=409, detail="That username is already taken. Choose another username.") from error
+            raise HTTPException(status_code=409, detail="This email is already registered. Please log in or reset your password.") from error
+        raise HTTPException(status_code=409, detail="This username is already taken. Please choose another username.") from error
     _send_verification_email(email, token)
     return {"message": "Account created. Check your email for a verification link before logging in."}
 
@@ -529,8 +561,10 @@ def login(payload: LoginPayload, request: Request, response: Response):
         if user is None or not hmac.compare_digest(
             _hash_password(payload.password, user["password_salt"]),
             user["password_hash"],
-        ) or (user["email"] and not user["email_verified"]):
+        ):
             raise HTTPException(status_code=401, detail="Unable to log in. Verify your email if needed, or check your credentials.")
+        if user["email"] and not user["email_verified"]:
+            return JSONResponse(status_code=403, content={"detail": "Email verification is required. Request another verification email to continue.", "code": "email_unverified"})
         token = _new_session(connection, int(user["id"]))
     _set_session_cookie(response, request, token)
     return {"username": user["username"]}
@@ -582,7 +616,14 @@ def verify_email(payload: TokenPayload, request: Request):
 
 @app.post("/api/auth/resend-verification")
 def resend_verification(payload: EmailPayload, request: Request):
-    _rate_limit(request, "resend_verification", 5, payload.email)
+    _rate_limit(
+        request,
+        "resend_verification",
+        5,
+        payload.email,
+        subject_limit=1,
+        subject_window=timedelta(seconds=60),
+    )
     email = _normalized_email(payload.email)
     verification_token = None
     with _auth_connection() as connection:
@@ -622,8 +663,37 @@ def forgot_password(payload: EmailPayload, request: Request):
         if user:
             reset_token = _create_auth_token(connection, int(user["id"]), "password_reset", PASSWORD_RESET_LIFETIME)
     if reset_token:
-        _send_password_reset_email(email, reset_token)
+        try:
+            _send_password_reset_email(email, reset_token)
+        except HTTPException as error:
+            logger.warning("Password reset email delivery failed status=%s", error.status_code)
     return {"message": "If an account exists for this email, you will receive a password reset link shortly."}
+
+
+@app.post("/api/auth/forgot-username", status_code=202)
+def forgot_username(payload: EmailPayload, request: Request):
+    _rate_limit(request, "forgot_username", 5, payload.email)
+    email = _normalized_email(payload.email)
+    with _auth_connection() as connection:
+        user = _execute(
+            connection,
+            "SELECT username FROM users WHERE LOWER(email) = LOWER(?) AND email_verified = TRUE",
+            (email,),
+        ).fetchone()
+    if user:
+        try:
+            _send_auth_email(
+                email,
+                "Your TradeMind username",
+                "Username recovery",
+                f"Your TradeMind username is: {user['username']}",
+                "Go to login",
+                _app_base_url(),
+                "This message was sent because a username reminder was requested.",
+            )
+        except HTTPException as error:
+            logger.warning("Username recovery email delivery failed status=%s", error.status_code)
+    return {"message": "If a verified account exists for this email, its username will be sent shortly."}
 
 
 @app.post("/api/auth/reset-password")
@@ -830,7 +900,7 @@ def send_telegram_message(
     telegram_message: TelegramMessage,
     authorization: str | None = Header(default=None),
 ):
-    current_user(authorization)
+    _authenticated_user_id(authorization)
     bot_token = telegram_message.bot_token.strip()
     chat_id = telegram_message.chat_id.strip()
     message = telegram_message.message.strip()
@@ -987,7 +1057,7 @@ def options_signal(
     trade_type: str = Query("INTRADAY", pattern="^(INTRADAY|BTST|STBT)$"),
     authorization: str | None = Header(default=None),
 ):
-    current_user(authorization)
+    _authenticated_user_id(authorization)
     return get_live_option_signal(underlying.upper(), trade_type)
 
 @app.post("/api/backtest")

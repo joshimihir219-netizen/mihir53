@@ -4,7 +4,7 @@ import "./strategy-lab.css";
 import "./auth.css";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
-import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, Mail, ArrowLeft, KeyRound, CheckCircle2} from "lucide-react";
+import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, Mail, ArrowLeft, KeyRound, CheckCircle2, Eye, EyeOff} from "lucide-react";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler);
 
@@ -73,6 +73,45 @@ function formatSignalMove(entryPrice, currentPrice){
 
 function authHeaders(includeJson = true){
   return includeJson ? {"Content-Type": "application/json"} : {};
+}
+
+async function readApiResponse(response, fallbackMessage){
+  const successful = response.ok;
+  if (response.status === 204) return {};
+  const responseText = await response.text();
+  let result = null;
+  if (responseText.trim()) {
+    try { result = JSON.parse(responseText); } catch {}
+  }
+  if (!successful) {
+    const detail = typeof result?.detail === "string"
+      ? result.detail
+      : Array.isArray(result?.detail)
+        ? result.detail.map((issue) => issue.msg).filter(Boolean).join(" ")
+        : "";
+    const error = new Error(detail || `${fallbackMessage} (HTTP ${response.status}).`);
+    error.status = response.status;
+    error.code = result?.code;
+    error.retryAfter = response.headers.get("Retry-After");
+    throw error;
+  }
+  if (!result || typeof result !== "object") {
+    throw new Error(`${fallbackMessage} The server returned an invalid response.`);
+  }
+  return result;
+}
+
+function passwordStrength(password){
+  if (!password) return {score: 0, label: "Enter a password"};
+  const checks = [
+    password.length >= 12,
+    /[a-z]/.test(password) && /[A-Z]/.test(password),
+    /\d/.test(password),
+    /[^A-Za-z0-9]/.test(password),
+    password.length >= 16
+  ];
+  const score = checks.filter(Boolean).length;
+  return {score, label: score <= 2 ? "Weak" : score <= 3 ? "Fair" : "Strong"};
 }
 
 function initialAuthMode(){
@@ -144,6 +183,8 @@ function App(){
   const [authBusy, setAuthBusy] = useState(false);
   const [recoveryEmail, setRecoveryEmail] = useState("");
   const [authToken] = useState(() => new URLSearchParams(window.location.search).get("token") || "");
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [confirmPasswordVisible, setConfirmPasswordVisible] = useState(false);
   const [telegramConfig, setTelegramConfig] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem("trademind-telegram") || "{}");
@@ -204,7 +245,7 @@ function App(){
           headers,
         });
         if (!response.ok) throw new Error("Session expired.");
-        const account = await response.json();
+        const account = await readApiResponse(response, "Could not check your account session.");
         if (cancelled) return;
         localStorage.removeItem("trademind-auth-session");
         localStorage.removeItem("trademind-session");
@@ -620,6 +661,9 @@ function App(){
       } else if (authMode === "recovery") {
         endpoint = "/auth/forgot-password";
         body = {email: recoveryEmail.trim()};
+      } else if (authMode === "forgotUsername") {
+        endpoint = "/auth/forgot-username";
+        body = {email: recoveryEmail.trim()};
       } else if (authMode === "reset") {
         if (!authToken) throw new Error("This reset link is incomplete. Request a new reset link.");
         if (loginForm.password.length < 12) throw new Error("Use a password with at least 12 characters.");
@@ -644,20 +688,7 @@ function App(){
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(body)
       });
-      const result = await response.json();
-      if (!response.ok) {
-        const detail = typeof result.detail === "string"
-          ? result.detail
-          : Array.isArray(result.detail)
-            ? result.detail.map((issue) => issue.msg).filter(Boolean).join(" ")
-            : "Could not complete the request. Please try again.";
-        if (authMode === "signup" && [502, 503].includes(response.status) && /email/i.test(detail)) {
-          setRecoveryEmail(loginForm.email.trim());
-          setAuthMode("pending");
-          setAuthMessage("");
-        }
-        throw new Error(detail);
-      }
+      const result = await readApiResponse(response, "Could not complete the request. Please try again.");
       if (authMode === "signup") {
         setRecoveryEmail(loginForm.email.trim());
         setAuthMode("pending");
@@ -677,6 +708,8 @@ function App(){
         }
       } else if (authMode === "recovery") {
         setAuthMessage(result.message);
+      } else if (authMode === "forgotUsername") {
+        setAuthMessage(result.message);
       } else if (authMode === "reset") {
         setAuthMode("login");
         setLoginForm((current) => ({...current, password: ""}));
@@ -695,10 +728,23 @@ function App(){
         setAuthMessage(result.message);
       }
     } catch (error) {
-      const deliveryFailedAfterSignup = authMode === "signup" && /email/i.test(error.message || "");
-      setLoginError(deliveryFailedAfterSignup
-        ? `Your account was created, but the verification email could not be delivered. ${error.message}`
-        : error.message || "Unable to reach the account service. Please try again.");
+      if (authMode === "login" && error.code === "email_unverified") {
+        setRecoveryEmail(loginForm.username.includes("@") ? loginForm.username.trim() : "");
+        setAuthMode("pending");
+        setAuthMessage("Verify your email to finish signing in. Enter your registered email below to request another link.");
+      } else if (authMode === "signup" && error.status === 409 && error.message.startsWith("This email is already registered")) {
+        setRecoveryEmail(loginForm.email.trim());
+        setAuthMode("pending");
+        setAuthMessage("This email is already registered. Log in or reset your password. If it is not verified yet, request another verification link below.");
+      } else if (authMode === "signup" && [502, 503].includes(error.status) && /email/i.test(error.message || "")) {
+        setRecoveryEmail(loginForm.email.trim());
+        setAuthMode("pending");
+        setAuthMessage("Your account was created, but its verification email could not be delivered. Request another link below.");
+      }
+      const rateLimitHint = error.status === 429 && error.retryAfter
+        ? ` Please wait about ${error.retryAfter} seconds before trying again.`
+        : "";
+      setLoginError(`${error.message || "Unable to reach the account service. Please try again."}${rateLimitHint}`);
     } finally {
       setAuthBusy(false);
     }
@@ -815,11 +861,13 @@ function App(){
   }
 
   if (!isLoggedIn) {
-    const showForm = ["login", "signup", "recovery", "reset", "upgrade", "pending", "upgrade_pending"].includes(authMode);
+    const showForm = ["login", "signup", "recovery", "forgotUsername", "reset", "upgrade", "pending", "upgrade_pending"].includes(authMode);
+    const strength = passwordStrength(loginForm.password);
     const authTitles = {
       login: "Welcome back",
       signup: "Create your account",
       recovery: "Recover your account",
+      forgotUsername: "Recover your username",
       reset: "Choose a new password",
       verify: "Verify your email",
       pending: "Check your inbox",
@@ -830,6 +878,7 @@ function App(){
       login: "Sign in to your trading workspace.",
       signup: "Start with a verified email and a strong password.",
       recovery: "Enter your registered email address.",
+      forgotUsername: "We will email the username to its verified address.",
       reset: "Use a unique password with at least 12 characters.",
       verify: "Confirm your address to activate your account.",
       pending: "Your account is ready once your email is verified.",
@@ -853,26 +902,30 @@ function App(){
           {showForm && <form onSubmit={handleLogin} className="loginForm authForm">
             {authMode === "login" && <>
               <label>Username or email<input autoComplete="username" minLength={3} maxLength={254} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="you@example.com or username" /></label>
-              <label>Password<input type="password" autoComplete="current-password" minLength={8} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="Your password" /></label>
+              <label>Password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="current-password" minLength={8} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="Your password" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
               <button className="authTextLink forgotLink" type="button" onClick={() => {setAuthMode("recovery"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("");}}>Forgot password?</button>
+              <button className="authTextLink forgotLink" type="button" onClick={() => {setAuthMode("forgotUsername"); setRecoveryEmail(""); setLoginError(""); setAuthMessage("");}}>Forgot username?</button>
             </>}
             {authMode === "signup" && <>
               <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Choose a username" /></label>
               <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={loginForm.email} onChange={(event) => setLoginForm((current) => ({...current, email: event.target.value}))} placeholder="you@example.com" /></label>
-              <label>Password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /></label>
-              <label>Confirm password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /></label>
+              <label>Password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
+              {loginForm.password && <div className={`passwordStrength strength-${strength.score}`}><div><span style={{width: `${strength.score * 20}%`}} /></div><small>Password strength: {strength.label}</small></div>}
+              <label>Confirm password<div className="authPasswordWrap"><input type={confirmPasswordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /><button type="button" aria-label={confirmPasswordVisible ? "Hide confirm password" : "Show confirm password"} onClick={() => setConfirmPasswordVisible((visible) => !visible)}>{confirmPasswordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
             </>}
             {authMode === "recovery" && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
+            {authMode === "forgotUsername" && <label>Verified email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
             {authMode === "reset" && <>
-              <label>New password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /></label>
-              <label>Confirm new password<input type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /></label>
+              <label>New password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
+              {loginForm.password && <div className={`passwordStrength strength-${strength.score}`}><div><span style={{width: `${strength.score * 20}%`}} /></div><small>Password strength: {strength.label}</small></div>}
+              <label>Confirm new password<div className="authPasswordWrap"><input type={confirmPasswordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Enter the same password" /><button type="button" aria-label={confirmPasswordVisible ? "Hide confirm password" : "Show confirm password"} onClick={() => setConfirmPasswordVisible((visible) => !visible)}>{confirmPasswordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
             </>}
             {authMode === "upgrade" && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={loginForm.email} onChange={(event) => setLoginForm((current) => ({...current, email: event.target.value}))} placeholder="you@example.com" /></label>}
             {["pending", "upgrade_pending"].includes(authMode) && <label>Email address<input type="email" autoComplete="email" maxLength={254} required value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="you@example.com" /></label>}
             {loginError && <div className="loginError" role="alert">{loginError}</div>}
             <button className="primary full authSubmit" type="submit" disabled={authBusy}>
               {authBusy ? <span className="authSpinner" aria-hidden="true" /> : authMode === "login" ? <LogIn size={16} /> : authMode === "recovery" ? <Mail size={16} /> : authMode === "reset" ? <KeyRound size={16} /> : <CheckCircle2 size={16} />}
-              {authBusy ? "Please wait…" : authMode === "login" ? "Log in" : authMode === "signup" ? "Create account" : authMode === "recovery" ? "Send reset link" : authMode === "reset" ? "Reset password" : authMode === "upgrade" ? "Send verification link" : "Resend verification email"}
+              {authBusy ? "Please wait…" : authMode === "login" ? "Log in" : authMode === "signup" ? "Create account" : authMode === "recovery" ? "Send reset link" : authMode === "forgotUsername" ? "Send username reminder" : authMode === "reset" ? "Reset password" : authMode === "upgrade" ? "Send verification link" : "Resend verification email"}
             </button>
           </form>}
           {!showForm && <>
@@ -885,7 +938,7 @@ function App(){
           </>}
           {authMode === "login" && <p className="authFooter">New to TradeMind? <button type="button" className="authTextLink" onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Create an account</button></p>}
           {authMode === "signup" && <p className="authFooter">Already registered? <button type="button" className="authTextLink" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button></p>}
-          {["recovery", "reset", "verify", "pending", "upgrade", "upgrade_pending"].includes(authMode) && <button className="authBack" type="button" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}><ArrowLeft size={15} /> Back to login</button>}
+          {["recovery", "forgotUsername", "reset", "verify", "pending", "upgrade", "upgrade_pending"].includes(authMode) && <button className="authBack" type="button" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}><ArrowLeft size={15} /> Back to login</button>}
         </div>
       </div>
     );

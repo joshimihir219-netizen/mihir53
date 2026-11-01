@@ -123,6 +123,65 @@
   box-shadow: 0 0 0 3px rgba(53, 208, 161, 0.12);
 }
 
+.authPasswordWrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.authCard .authPasswordWrap input {
+  padding-right: 44px;
+}
+
+.authCard .authPasswordWrap button {
+  position: absolute;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 3px;
+  color: #8fa3b1;
+  background: transparent;
+  cursor: pointer;
+}
+
+.authCard .authPasswordWrap button:hover {
+  color: #55d7ae;
+}
+
+.passwordStrength {
+  display: grid;
+  gap: 6px;
+  margin-top: -9px;
+}
+
+.passwordStrength > div {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #273642;
+}
+
+.passwordStrength > div span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #dfab53;
+  transition: width 180ms ease, background-color 180ms ease;
+}
+
+.passwordStrength.strength-4 > div span,
+.passwordStrength.strength-5 > div span {
+  background: #35d0a1;
+}
+
+.passwordStrength small {
+  color: #95a7b5;
+  font-size: 11px;
+}
+
 .authCard .forgotLink {
   justify-self: end;
   margin-top: -8px;
