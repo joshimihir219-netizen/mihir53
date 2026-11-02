@@ -185,6 +185,143 @@ class AuthenticationFlowTests(unittest.TestCase):
         self.assertEqual(response.headers.get("content-type", "").split(";")[0], "application/json")
         self.assertNotIn("private connection detail", response.text)
 
+    def risk_settings(self, **overrides):
+        settings = {
+            "accountEquity": "10000",
+            "riskPerTradePct": "1",
+            "dailyLossMode": "amount",
+            "dailyLossValue": "500",
+            "maxDrawdownPct": "10",
+            "maxOpenRiskPct": "3",
+            "maxTradesPerDay": "5",
+            "tradingTimezone": "UTC",
+            "tradingDayStart": "00:00",
+            "capitalBox": "10000",
+            "riskPerTrade": "1",
+        }
+        settings.update(overrides)
+        return settings
+
+    def login_user(self, username="marketpilot"):
+        self.register(username=username)
+        return self.client.post("/api/auth/login", json={
+            "username": username,
+            "password": "MarketPilot!42",
+        })
+
+    def test_risk_endpoints_require_login(self):
+        self.assertEqual(self.client.get("/api/risk/status").status_code, 401)
+        self.assertEqual(self.client.get("/api/risk/positions").status_code, 401)
+        response = self.client.post("/api/risk/positions", json={
+            "instrument": "Example spot",
+            "instrument_type": "spot",
+            "direction": "BUY",
+            "entry_price": 100,
+            "stop_price": 98,
+            "target_price": 104,
+            "quantity": 1,
+            "contract_multiplier": 1,
+            "quantity_step": 1,
+        })
+        self.assertEqual(response.status_code, 401)
+
+    def test_settings_and_manual_positions_persist_per_user(self):
+        self.login_user()
+        saved = self.client.put("/api/risk/settings", json={"settings": self.risk_settings()})
+        self.assertEqual(saved.status_code, 200)
+        position = self.client.post("/api/risk/positions", json={
+            "instrument": "Example spot",
+            "instrument_type": "spot",
+            "direction": "BUY",
+            "entry_price": 100,
+            "stop_price": 98,
+            "target_price": 104,
+            "quantity": 25,
+            "contract_multiplier": 1,
+            "quantity_step": 1,
+            "fee_bps": 0,
+            "slippage_per_unit": 0,
+        })
+        self.assertEqual(position.status_code, 201)
+        self.assertEqual(position.json()["risk_amount"], 50)
+        self.assertEqual(len(self.client.get("/api/risk/positions").json()), 1)
+        self.assertEqual(self.client.get("/api/risk/settings").json()["accountEquity"], "10000")
+        self.assertEqual(self.client.get("/api/risk/status").json()["current_open_risk"], 50)
+
+        second_client = TestClient(main.app)
+        try:
+            second_client.post("/api/auth/signup", json={
+                "username": "secondpilot",
+                "password": "MarketPilot!42",
+                "confirm_password": "MarketPilot!42",
+            })
+            second_client.post("/api/auth/login", json={
+                "username": "secondpilot",
+                "password": "MarketPilot!42",
+            })
+            self.assertEqual(second_client.get("/api/risk/positions").json(), [])
+        finally:
+            second_client.close()
+
+    def test_server_blocks_trade_above_per_trade_budget(self):
+        self.login_user()
+        self.client.put("/api/risk/settings", json={"settings": self.risk_settings()})
+        response = self.client.post("/api/risk/positions", json={
+            "instrument": "Example spot",
+            "instrument_type": "spot",
+            "direction": "BUY",
+            "entry_price": 100,
+            "stop_price": 98,
+            "target_price": 104,
+            "quantity": 60,
+            "contract_multiplier": 1,
+            "quantity_step": 1,
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("per-trade risk limit", response.json()["detail"]["reasons"][0])
+        self.assertEqual(self.client.get("/api/risk/positions").json(), [])
+
+    def test_server_blocks_position_above_available_capital(self):
+        self.login_user()
+        self.client.put("/api/risk/settings", json={"settings": self.risk_settings(
+            accountEquity="1000",
+            capitalBox="1000",
+            riskPerTradePct="100",
+            riskPerTrade="100",
+            dailyLossValue="5000",
+            maxDrawdownPct="100",
+            maxOpenRiskPct="100",
+        )})
+        response = self.client.post("/api/risk/positions", json={
+            "instrument": "Example spot",
+            "instrument_type": "spot",
+            "direction": "BUY",
+            "entry_price": 100,
+            "stop_price": 98,
+            "target_price": 104,
+            "quantity": 11,
+            "contract_multiplier": 1,
+            "quantity_step": 1,
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("available capital", response.json()["detail"]["message"])
+
+    def test_cash_index_cannot_be_recorded_as_a_position(self):
+        self.login_user()
+        response = self.client.post("/api/risk/positions", json={
+            "instrument": "NIFTY 50",
+            "instrument_type": "nifty_index",
+            "direction": "BUY",
+            "entry_price": 100,
+            "stop_price": 98,
+            "target_price": 104,
+            "quantity": 1,
+            "contract_multiplier": 1,
+            "quantity_step": 1,
+        })
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("not directly tradable", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@ import React, {useEffect, useMemo, useRef, useState} from "react";
 import "./signal-details.css";
 import "./strategy-lab.css";
 import "./auth.css";
+import RiskManagement from "./RiskManagement";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
 import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, CheckCircle2, Eye, EyeOff} from "lucide-react";
@@ -713,13 +714,13 @@ function App(){
     setSearchQuery("");
   }
 
-  async function saveRiskRules(event){
-    event.preventDefault();
+  async function saveRiskRules(event, settingsToSave = riskRules){
+    event?.preventDefault();
     if (!isLoggedIn) throw new Error("Sign in to save user-specific risk rules.");
     const response = await fetch(API + "/risk/settings", {
       method: "PUT",
       headers: authHeaders(),
-      body: JSON.stringify({settings: riskRules})
+      body: JSON.stringify({settings: settingsToSave})
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.detail || "Risk settings could not be saved.");
@@ -934,7 +935,7 @@ function App(){
           {page === "Dashboard" && <Dashboard markets={markets} symbol={symbol} setSymbol={setSymbol} market={market} signal={signal} chartInterval={chartInterval} setChartInterval={setChartInterval} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} onViewAll={() => setPage("Signals")} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Signals" && <Signals symbol={symbol} setSymbol={setSymbol} signal={signal} markets={markets} market={market} chartInterval={chartInterval} setChartInterval={setChartInterval} strategies={strategies} selectedStrategy={selectedStrategy} setSelectedStrategy={setSelectedStrategy} riskRules={riskRules} isLoggedIn={isLoggedIn} notifyTelegram={notifyTelegram} addLog={addLog} />}
           {page === "Backtesting" && <Backtesting backtest={backtest} backtestError={backtestError} runBacktest={() => runBacktest(backtestForm).catch((error) => addLog(error.message, "warning"))} symbol={symbol} backtestForm={backtestForm} setBacktestForm={setBacktestForm} strategies={strategies} savedBacktests={savedBacktests} onLoadSavedBacktest={(run) => { setBacktest(run.result); setBacktestForm((current) => ({...current, symbol: run.result.symbol || current.symbol, strategy: run.strategy_name, timeframe: run.result.timeframe || current.timeframe, durationValue: String(run.result.duration || current.durationValue), durationUnit: run.result.duration_unit || current.durationUnit, initialCapital: String(run.result.initial_capital || current.initialCapital), positionSize: String(run.result.position_size || current.positionSize), stopLoss: String(run.result.stop_loss_pct || current.stopLoss), takeProfitRR: String(run.result.take_profit_rr || current.takeProfitRR)})); }} notifyTelegram={notifyTelegram} addLog={addLog} />}
-          {page === "Risk Management" && <Risk riskRules={riskRules} setRiskRules={setRiskRules} saveRiskRules={saveRiskRules} addLog={addLog} isLoggedIn={isLoggedIn} />}
+          {page === "Risk Management" && <RiskManagement riskRules={riskRules} setRiskRules={setRiskRules} saveRiskRules={saveRiskRules} addLog={addLog} isLoggedIn={isLoggedIn} />}
           {page === "Reports" && <Reports backtest={backtest} exportReport={exportReport} exportMessage={exportMessage} notifyTelegram={notifyTelegram} />}
           {page === "Strategies" && <Strategies strategies={strategies} saveStrategy={saveStrategy} removeStrategy={removeStrategy} onBacktest={startStrategyBacktest} savedBacktests={savedBacktests} addLog={addLog} isLoggedIn={isLoggedIn} />}
         </div>
@@ -1746,101 +1747,6 @@ function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm
         </>
       ) : <div className="empty panel">Run a backtest to calculate P&L, win rate and maximum drawdown.</div>}
       {savedBacktests?.length > 0 && <section className="panel savedBacktestPanel"><div className="panelHead"><h3>Saved Backtest Runs</h3><span>{savedBacktests.length} recent account runs</span></div><div className="savedRunList">{savedBacktests.slice(0, 20).map((run) => <div className="savedRunRow" key={run.id}><div><strong>{run.result?.symbol || "Market"} · {run.strategy_name}</strong><small>Version {run.strategy_version || 0} · {run.result?.timeframe || "—"} · {run.created_at ? new Date(run.created_at).toLocaleString() : "Saved run"}</small></div><span className={Number(run.result?.pnl) >= 0 ? "positiveValue" : "negativeValue"}>{toCurrency(Number(run.result?.pnl || 0))}</span><button className="outline" type="button" onClick={() => onLoadSavedBacktest(run)}>Open</button></div>)}</div></section>}
-    </>
-  );
-}
-
-function Risk({riskRules, setRiskRules, saveRiskRules, addLog, isLoggedIn}){
-  const [saved, setSaved] = useState(false);
-  const [saveError, setSaveError] = useState("");
-  const [direction, setDirection] = useState("BUY");
-  const [entryPrice, setEntryPrice] = useState("");
-  const [stopPrice, setStopPrice] = useState("");
-  const [targetPrice, setTargetPrice] = useState("");
-  const [instrument, setInstrument] = useState("NIFTY 50");
-  const [lotSize, setLotSize] = useState("1");
-  const [multiplier, setMultiplier] = useState("1");
-  const [currency, setCurrency] = useState("INR");
-  const updateRule = (field, value) => { setRiskRules((current) => ({...current, [field]: value})); setSaved(false); };
-  const balance = Number(riskRules.capitalBox || 0);
-  const entry = Number(entryPrice);
-  const stop = Number(stopPrice);
-  const target = Number(targetPrice);
-  const lot = Number(lotSize);
-  const contractMultiplier = Number(multiplier);
-  const riskDistance = direction === "BUY" ? entry - stop : stop - entry;
-  const rewardDistance = direction === "BUY" ? target - entry : entry - target;
-  const riskBudget = balance * Number(riskRules.riskPerTrade || 0) / 100;
-  const unitRisk = riskDistance * lot * contractMultiplier;
-  const lots = unitRisk > 0 ? Math.floor(riskBudget / unitRisk) : 0;
-  const quantity = lots * lot;
-  const potentialLoss = quantity * riskDistance * contractMultiplier;
-  const potentialProfit = quantity * rewardDistance * contractMultiplier;
-  const riskReward = riskDistance > 0 && rewardDistance > 0 ? rewardDistance / riskDistance : null;
-  const money = (value) => `${currency === "INR" ? "₹" : "$"}${Number(value).toLocaleString(currency === "INR" ? "en-IN" : "en-US", {maximumFractionDigits: 2})}`;
-
-  async function submitRiskRules(event){
-    setSaveError("");
-    try {
-      await saveRiskRules(event);
-      setSaved(true);
-      addLog("Risk rules saved to your account.", "success");
-    } catch (error) {
-      event.preventDefault();
-      setSaveError(error.message);
-    }
-  }
-
-  return (
-    <>
-      <div className="pageHead"><div><p className="eyebrow">PROTECTION</p><h1>Risk Management</h1><p>Rule-based limits and position sizing. Passing a check is not a profitability guarantee.</p></div><span className="statusBadge">{isLoggedIn ? "ACCOUNT SETTINGS" : "SIGN IN TO SAVE"}</span></div>
-      <div className="riskOverview">
-        <div className="riskMetric"><span>Configured balance</span><strong>{money(balance)}</strong><small>Manual demo capital, not a connected broker balance</small></div>
-        <div className="riskMetric"><span>Available trading capital</span><strong>{money(balance)}</strong><small>Estimate based on configured demo capital</small></div>
-        <div className="riskMetric"><span>Today's P&amp;L</span><strong>Not available</strong><small>No platform trade ledger connected</small></div>
-        <div className="riskMetric"><span>Current drawdown</span><strong>Not available</strong><small>No actual account equity history</small></div>
-      </div>
-      <div className="riskOverview riskOverviewSecondary">
-        <div className="riskMetric"><span>Total open risk</span><strong>Not available</strong><small>Open positions are not synced</small></div>
-        <div className="riskMetric"><span>Daily loss allowance</span><strong>{money(Number(riskRules.dailyLoss || 0))}</strong><small>Limit configured; usage cannot be verified</small></div>
-      </div>
-      <div className="riskWorkspace">
-        <form className="panel riskRulesForm" onSubmit={submitRiskRules}>
-          <div className="panelHead"><h3>Risk Rules</h3><span>{isLoggedIn ? "Saved per account" : "Sign in required"}</span></div>
-          <label>Manual demo capital ({currency})<input type="number" min="1" step="1000" value={riskRules.capitalBox || ""} onChange={(event) => updateRule("capitalBox", event.target.value)} required /></label>
-          <label>Default risk per trade (%)<input type="number" min="0.01" max="100" step="0.1" value={riskRules.riskPerTrade || "1"} onChange={(event) => updateRule("riskPerTrade", event.target.value)} required /></label>
-          <label>Maximum daily loss ({currency})<input type="number" min="0" step="100" value={riskRules.dailyLoss || "0"} onChange={(event) => updateRule("dailyLoss", event.target.value)} /></label>
-          <label>Maximum drawdown (%)<input type="number" min="0" max="100" step="0.1" value={riskRules.maxDrawdown || "8"} onChange={(event) => updateRule("maxDrawdown", event.target.value)} /></label>
-          <label>Maximum trades per day<input type="number" min="1" step="1" value={riskRules.maxTradesPerDay || "5"} onChange={(event) => updateRule("maxTradesPerDay", event.target.value)} /></label>
-          <label>Minimum risk-to-reward<input type="number" min="0.1" step="0.1" value={riskRules.minimumRiskReward || "2"} onChange={(event) => updateRule("minimumRiskReward", event.target.value)} /></label>
-          <label>Display currency<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="INR">INR (₹)</option><option value="USD">USD ($)</option></select></label>
-          <button className="primary" type="submit" disabled={!isLoggedIn}>Save Risk Rules</button>
-          {saved && <span role="status">Saved to your account.</span>}
-          {saveError && <p className="warningText" role="alert">{saveError}</p>}
-        </form>
-        <section className="panel calculatorPanel">
-          <div className="panelHead"><h3>Position Size &amp; R:R Calculator</h3><span>Uses your configured balance and risk</span></div>
-          <div className="calculatorGrid">
-            <label>Instrument<select value={instrument} onChange={(event) => setInstrument(event.target.value)}>{["NIFTY 50", "BANK NIFTY", "SENSEX", "GOLD", "SILVER", "BTC/USDT", "ETH/USDT", "Forex pair", "Custom"].map((item) => <option key={item}>{item}</option>)}</select></label>
-            <label>Direction<select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label>
-            <label>Entry price<input type="number" min="0" step="any" value={entryPrice} onChange={(event) => setEntryPrice(event.target.value)} /></label>
-            <label>Stop-loss price<input type="number" min="0" step="any" value={stopPrice} onChange={(event) => setStopPrice(event.target.value)} /></label>
-            <label>Target price<input type="number" min="0" step="any" value={targetPrice} onChange={(event) => setTargetPrice(event.target.value)} /></label>
-            <label>Lot size<input type="number" min="1" step="1" value={lotSize} onChange={(event) => setLotSize(event.target.value)} /></label>
-            <label>Contract multiplier<input type="number" min="0.000001" step="any" value={multiplier} onChange={(event) => setMultiplier(event.target.value)} /></label>
-          </div>
-          <div className="calculatorResults">
-            <Row name="Maximum risk budget" value={money(riskBudget)} status={`${riskRules.riskPerTrade || 1}% of demo balance`} />
-            <Row name="Recommended quantity" value={Number.isFinite(quantity) && quantity > 0 ? quantity.toLocaleString() : "—"} status={lots > 0 ? `${lots} lot(s)` : "Check prices and lot size"} />
-            <Row name="Potential loss" value={potentialLoss > 0 ? money(potentialLoss) : "—"} status="Before fees and slippage" />
-            <Row name="Potential profit" value={potentialProfit > 0 ? money(potentialProfit) : "—"} status="Before fees and slippage" />
-            <Row name="Risk-to-reward" value={riskReward ? `1:${riskReward.toFixed(2)}` : "—"} status={riskReward && riskReward >= Number(riskRules.minimumRiskReward || 2) ? "Meets configured minimum" : "Below minimum or incomplete"} />
-            <Row name="Break-even win rate" value={riskReward ? `${(100 / (1 + riskReward)).toFixed(1)}%` : "—"} status="Excludes costs" />
-          </div>
-          <p className="warningText">{instrument}: set lot size and contract multiplier from current contract specifications. The calculator does not fetch broker lot sizes, taxes, or option premiums.</p>
-        </section>
-      </div>
-      <section className="panel drawdownNotice"><div><p className="eyebrow">DRAWDOWN MONITOR</p><h3>Equity history unavailable</h3><p>There is no connected account equity stream or completed-trade ledger, so drawdown, discipline statistics, daily lockout, and live risk alerts cannot be truthfully calculated yet.</p></div><Row name="Configured maximum drawdown" value={`${riskRules.maxDrawdown || 8}%`} status="Rule only; no observed equity" /></section>
     </>
   );
 }

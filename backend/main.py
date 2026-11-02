@@ -1,10 +1,11 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as time_of_day, timedelta, timezone
 from contextlib import contextmanager
 import hashlib
 import hmac
 from html import escape as escape_html
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,7 @@ import secrets
 import sqlite3
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,7 @@ from backtest import custom_strategy_mask, run_backtest
 from backtest import STRATEGIES
 from market_data import TIMEFRAME_HISTORY, market_frame, _duration_offset, _max_duration
 from angel_options import get_live_option_signal
+from risk_calculator import assess_protection, calculate_position
 
 app = FastAPI(title="AI Trading Dashboard API", version="2.0.0")
 logger = logging.getLogger("trademind.auth")
@@ -116,6 +119,27 @@ class StrategyPayload(BaseModel):
 
 class RiskSettingsPayload(BaseModel):
     settings: dict
+
+
+class RiskPositionPayload(BaseModel):
+    instrument: str = Field(min_length=1, max_length=80)
+    instrument_type: str = Field(pattern="^(nifty_index|spot|futures|options|custom)$")
+    direction: str = Field(pattern="^(BUY|SELL)$")
+    entry_price: float = Field(gt=0)
+    stop_price: float = Field(gt=0)
+    target_price: float = Field(gt=0)
+    quantity: float = Field(gt=0)
+    contract_multiplier: float = Field(gt=0)
+    quantity_step: float = Field(gt=0)
+    fee_bps: float = Field(default=0, ge=0, le=10000)
+    slippage_per_unit: float = Field(default=0, ge=0)
+    margin_pct: float | None = Field(default=None, ge=0, le=100)
+
+
+class RiskPositionUpdatePayload(BaseModel):
+    realized_pnl: float | None = None
+    unrealized_pnl: float | None = None
+    close: bool = False
 
 
 @contextmanager
@@ -295,6 +319,30 @@ def _initialize_auth_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS user_risk_positions (
+                id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
+                user_id {user_id_type} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                instrument TEXT NOT NULL,
+                instrument_type TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                entry_price DOUBLE PRECISION NOT NULL,
+                stop_price DOUBLE PRECISION NOT NULL,
+                target_price DOUBLE PRECISION NOT NULL,
+                quantity DOUBLE PRECISION NOT NULL,
+                contract_multiplier DOUBLE PRECISION NOT NULL,
+                quantity_step DOUBLE PRECISION NOT NULL,
+                fee_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
+                slippage_per_unit DOUBLE PRECISION NOT NULL DEFAULT 0,
+                risk_amount DOUBLE PRECISION NOT NULL,
+                unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+                realized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'open',
+                opened_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+        """)
+        _execute(connection, "CREATE INDEX IF NOT EXISTS user_risk_positions_user_opened_idx ON user_risk_positions (user_id, opened_at)")
         _execute(connection, f"""
             CREATE TABLE IF NOT EXISTS backtest_runs (
                 id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
@@ -837,9 +885,117 @@ def get_risk_settings(authorization: str | None = Header(default=None)):
     return json.loads(row["settings"]) if row else {}
 
 
+def _risk_config(settings):
+    daily_mode = settings.get("dailyLossMode", "amount")
+    daily_limit = settings.get("dailyLossValue", settings.get("dailyLoss", 5000))
+    max_trades = settings.get("maxTradesPerDay")
+    return {
+        "account_equity": settings.get("accountEquity", settings.get("capitalBox", 250000)),
+        "risk_per_trade_pct": settings.get("riskPerTradePct", settings.get("riskPerTrade", 1)),
+        "daily_loss_limit": daily_limit,
+        "daily_loss_mode": daily_mode,
+        "max_drawdown_pct": settings.get("maxDrawdownPct", settings.get("maxDrawdown", 8)),
+        "max_open_risk_pct": settings.get("maxOpenRiskPct", 3),
+        "max_trades_per_day": int(max_trades) if max_trades not in (None, "") else None,
+    }
+
+
+def _validate_risk_settings(settings):
+    config = _risk_config(settings)
+    try:
+        assess_protection(
+            **config,
+            daily_net_pnl=0,
+            overall_net_pnl=0,
+            current_open_risk=0,
+            trades_today=0,
+        )
+        timezone_name = settings.get("tradingTimezone", "Asia/Kolkata")
+        ZoneInfo(timezone_name)
+        datetime.strptime(settings.get("tradingDayStart", "00:00"), "%H:%M")
+        if config["max_trades_per_day"] is not None and config["max_trades_per_day"] < 1:
+            raise ValueError("Maximum trades per day must be at least one.")
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+        raise HTTPException(status_code=422, detail=str(error) or "Risk settings are invalid.") from None
+
+
+def _risk_day_start(settings, now=None):
+    timezone_name = settings.get("tradingTimezone", "Asia/Kolkata")
+    try:
+        timezone_info = ZoneInfo(timezone_name)
+        boundary = datetime.strptime(settings.get("tradingDayStart", "00:00"), "%H:%M").time()
+    except (ValueError, ZoneInfoNotFoundError):
+        raise HTTPException(status_code=422, detail="Configure a valid trading timezone and day start.") from None
+    local_now = (now or datetime.now(timezone.utc)).astimezone(timezone_info)
+    trading_date = local_now.date()
+    if local_now.timetz().replace(tzinfo=None) < boundary:
+        trading_date -= timedelta(days=1)
+    return datetime.combine(trading_date, boundary, tzinfo=timezone_info).astimezone(timezone.utc).isoformat()
+
+
+def _risk_position_record(row):
+    return {
+        "id": int(row["id"]),
+        "instrument": row["instrument"],
+        "instrument_type": row["instrument_type"],
+        "direction": row["direction"],
+        "entry_price": float(row["entry_price"]),
+        "stop_price": float(row["stop_price"]),
+        "target_price": float(row["target_price"]),
+        "quantity": float(row["quantity"]),
+        "contract_multiplier": float(row["contract_multiplier"]),
+        "quantity_step": float(row["quantity_step"]),
+        "fee_bps": float(row["fee_bps"]),
+        "slippage_per_unit": float(row["slippage_per_unit"]),
+        "risk_amount": float(row["risk_amount"]),
+        "unrealized_pnl": float(row["unrealized_pnl"]),
+        "realized_pnl": float(row["realized_pnl"]),
+        "status": row["status"],
+        "opened_at": row["opened_at"],
+        "closed_at": row["closed_at"],
+    }
+
+
+def _risk_snapshot(connection, user_id, settings):
+    day_start = _risk_day_start(settings)
+    rows = _execute(
+        connection,
+        "SELECT * FROM user_risk_positions WHERE user_id = ? ORDER BY opened_at DESC",
+        (user_id,),
+    ).fetchall()
+    open_rows = [row for row in rows if row["status"] == "open"]
+    realized_today = sum(
+        float(row["realized_pnl"])
+        for row in rows
+        if row["status"] == "closed" and row["closed_at"] >= day_start
+    )
+    unrealized_open = sum(float(row["unrealized_pnl"]) for row in open_rows)
+    overall_net = sum(float(row["realized_pnl"]) for row in rows) + unrealized_open
+    opened_today = sum(1 for row in rows if row["opened_at"] >= day_start)
+    protection = assess_protection(
+        **_risk_config(settings),
+        daily_net_pnl=realized_today + unrealized_open,
+        overall_net_pnl=overall_net,
+        current_open_risk=sum(float(row["risk_amount"]) for row in open_rows),
+        trades_today=opened_today,
+    )
+    return {
+        **protection,
+        "today_realized_pnl": realized_today,
+        "open_unrealized_pnl": unrealized_open,
+        "daily_net_pnl": realized_today + unrealized_open,
+        "overall_net_pnl": overall_net,
+        "trades_today": opened_today,
+        "trading_day_starts_at": day_start,
+        "trading_timezone": settings.get("tradingTimezone", "Asia/Kolkata"),
+        "data_mode": "Manual journal; no broker account data is connected.",
+    }
+
+
 @app.put("/api/risk/settings")
 def save_risk_settings(payload: RiskSettingsPayload, authorization: str | None = Header(default=None)):
     user_id = _authenticated_user_id(authorization)
+    _validate_risk_settings(payload.settings)
     now = datetime.now(timezone.utc).isoformat()
     settings = json.dumps(payload.settings)
     with _auth_connection() as connection:
@@ -849,6 +1005,125 @@ def save_risk_settings(payload: RiskSettingsPayload, authorization: str | None =
         else:
             _execute(connection, "INSERT INTO user_risk_settings (user_id, settings, updated_at) VALUES (?, ?, ?)", (user_id, settings, now))
     return payload.settings
+
+
+@app.get("/api/risk/status")
+def get_risk_status(authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        row = _execute(connection, "SELECT settings FROM user_risk_settings WHERE user_id = ?", (user_id,)).fetchone()
+        settings = json.loads(row["settings"]) if row else {}
+        return _risk_snapshot(connection, user_id, settings)
+
+
+@app.get("/api/risk/positions")
+def list_risk_positions(authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(
+            connection,
+            "SELECT * FROM user_risk_positions WHERE user_id = ? ORDER BY opened_at DESC LIMIT 100",
+            (user_id,),
+        ).fetchall()
+    return [_risk_position_record(row) for row in rows]
+
+
+@app.post("/api/risk/positions", status_code=201)
+def create_risk_position(payload: RiskPositionPayload, authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        saved = _execute(connection, "SELECT settings FROM user_risk_settings WHERE user_id = ?", (user_id,)).fetchone()
+        settings = json.loads(saved["settings"]) if saved else {}
+        snapshot = _risk_snapshot(connection, user_id, settings)
+        try:
+            calculation = calculate_position(
+                instrument_type=payload.instrument_type,
+                direction=payload.direction,
+                entry_price=payload.entry_price,
+                stop_price=payload.stop_price,
+                target_price=payload.target_price,
+                risk_budget=snapshot["maximum_permitted_risk"],
+                account_equity=_risk_config(settings)["account_equity"],
+                contract_multiplier=payload.contract_multiplier,
+                quantity_step=payload.quantity_step,
+                fee_bps=payload.fee_bps,
+                slippage_per_unit=payload.slippage_per_unit,
+                planned_quantity=payload.quantity,
+                margin_pct=payload.margin_pct,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        step_count = payload.quantity / payload.quantity_step
+        if not math.isclose(step_count, round(step_count), rel_tol=0, abs_tol=1e-8):
+            raise HTTPException(status_code=422, detail="Quantity must be a whole multiple of the configured lot or quantity step.")
+        if payload.quantity > calculation["capital_quantity_limit"] + 1e-8:
+            raise HTTPException(status_code=409, detail={
+                "message": "Trade exceeds the available capital or configured margin capacity.",
+                "reasons": ["Planned quantity exceeds the maximum permitted by account capital or margin."],
+                "maximum_permitted_risk": snapshot["maximum_permitted_risk"],
+                "maximum_quantity": calculation["maximum_quantity"],
+                "planned_risk": calculation["planned_risk"],
+            })
+        updated_snapshot = assess_protection(
+            **_risk_config(settings),
+            daily_net_pnl=snapshot["daily_net_pnl"],
+            overall_net_pnl=snapshot["overall_net_pnl"],
+            current_open_risk=snapshot["current_open_risk"],
+            trades_today=snapshot["trades_today"],
+            proposed_risk=calculation["planned_risk"],
+        )
+        if updated_snapshot["blocked"]:
+            raise HTTPException(status_code=409, detail={
+                "message": "Trade blocked by your risk rules.",
+                "reasons": updated_snapshot["reasons"],
+                "maximum_permitted_risk": updated_snapshot["maximum_permitted_risk"],
+                "maximum_quantity": calculation["maximum_quantity"],
+                "planned_risk": calculation["planned_risk"],
+            })
+        opened_at = datetime.now(timezone.utc).isoformat()
+        cursor = _execute(connection, """
+            INSERT INTO user_risk_positions (
+                user_id, instrument, instrument_type, direction, entry_price, stop_price, target_price,
+                quantity, contract_multiplier, quantity_step, fee_bps, slippage_per_unit, risk_amount,
+                opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+        """, (
+            user_id, payload.instrument, payload.instrument_type, payload.direction, payload.entry_price,
+            payload.stop_price, payload.target_price, payload.quantity, payload.contract_multiplier,
+            payload.quantity_step, payload.fee_bps, payload.slippage_per_unit, calculation["planned_risk"], opened_at,
+        ))
+        position_id = int(cursor.fetchone()["id"])
+        row = _execute(connection, "SELECT * FROM user_risk_positions WHERE id = ? AND user_id = ?", (position_id, user_id)).fetchone()
+    return _risk_position_record(row)
+
+
+@app.put("/api/risk/positions/{position_id}")
+def update_risk_position(position_id: int, payload: RiskPositionUpdatePayload, authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    if payload.realized_pnl is not None and not math.isfinite(payload.realized_pnl):
+        raise HTTPException(status_code=422, detail="Realized P&L must be a finite number.")
+    if payload.unrealized_pnl is not None and not math.isfinite(payload.unrealized_pnl):
+        raise HTTPException(status_code=422, detail="Unrealized P&L must be a finite number.")
+    with _auth_connection() as connection:
+        row = _execute(connection, "SELECT status FROM user_risk_positions WHERE id = ? AND user_id = ?", (position_id, user_id)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Position not found.")
+        if row["status"] != "open":
+            raise HTTPException(status_code=409, detail="Closed positions cannot be changed.")
+        if payload.close:
+            if payload.realized_pnl is None:
+                raise HTTPException(status_code=422, detail="Enter realized P&L to close this manual position.")
+            _execute(connection, """
+                UPDATE user_risk_positions
+                SET status = 'closed', realized_pnl = ?, unrealized_pnl = 0, closed_at = ?
+                WHERE id = ? AND user_id = ?
+            """, (payload.realized_pnl, datetime.now(timezone.utc).isoformat(), position_id, user_id))
+        elif payload.unrealized_pnl is not None:
+            _execute(connection, "UPDATE user_risk_positions SET unrealized_pnl = ? WHERE id = ? AND user_id = ?", (payload.unrealized_pnl, position_id, user_id))
+        else:
+            raise HTTPException(status_code=422, detail="Provide unrealized P&L or close the position with realized P&L.")
+        updated = _execute(connection, "SELECT * FROM user_risk_positions WHERE id = ? AND user_id = ?", (position_id, user_id)).fetchone()
+    return _risk_position_record(updated)
 
 
 @app.get("/api/backtests")
