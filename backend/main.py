@@ -142,6 +142,29 @@ class RiskPositionUpdatePayload(BaseModel):
     close: bool = False
 
 
+class AdminUserUpdatePayload(BaseModel):
+    role: str | None = Field(default=None, pattern="^(USER|ADMIN)$")
+    account_status: str | None = Field(default=None, pattern="^(ACTIVE|SUSPENDED)$")
+
+
+class AdminStrategyPayload(StrategyPayload):
+    published: bool = False
+
+
+class UserFeedbackPayload(BaseModel):
+    category: str = Field(min_length=2, max_length=40)
+    subject: str = Field(min_length=3, max_length=120)
+    message: str = Field(min_length=5, max_length=4000)
+
+
+class AdminFeedbackUpdatePayload(BaseModel):
+    status: str = Field(pattern="^(OPEN|IN_REVIEW|RESOLVED)$")
+
+
+class AdminSettingsPayload(BaseModel):
+    settings: dict
+
+
 @contextmanager
 def _auth_connection():
     if DATABASE_URL:
@@ -184,6 +207,8 @@ def _ensure_user_columns(connection):
             "email": "TEXT",
             "email_verified": "BOOLEAN NOT NULL DEFAULT FALSE",
             "password_updated_at": "TEXT",
+            "role": "TEXT NOT NULL DEFAULT 'USER'",
+            "account_status": "TEXT NOT NULL DEFAULT 'ACTIVE'",
         }
     else:
         columns = {row["name"] for row in _execute(connection, "PRAGMA table_info(users)").fetchall()}
@@ -191,6 +216,8 @@ def _ensure_user_columns(connection):
             "email": "TEXT",
             "email_verified": "INTEGER NOT NULL DEFAULT 0",
             "password_updated_at": "TEXT",
+            "role": "TEXT NOT NULL DEFAULT 'USER'",
+            "account_status": "TEXT NOT NULL DEFAULT 'ACTIVE'",
         }
     for column, definition in additions.items():
         if DATABASE_URL:
@@ -298,10 +325,20 @@ def _initialize_auth_db():
                 definition TEXT NOT NULL,
                 version INTEGER NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
+                published INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
+        if DATABASE_URL:
+            strategy_columns = {
+                row["column_name"] for row in _execute(connection,
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'strategies'").fetchall()
+            }
+        else:
+            strategy_columns = {row["name"] for row in _execute(connection, "PRAGMA table_info(strategies)").fetchall()}
+        if "published" not in strategy_columns:
+            _execute(connection, "ALTER TABLE strategies ADD COLUMN published INTEGER NOT NULL DEFAULT 0")
         _execute(connection, f"""
             CREATE TABLE IF NOT EXISTS strategy_versions (
                 id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
@@ -355,6 +392,56 @@ def _initialize_auth_db():
                 created_at TEXT NOT NULL
             )
         """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS admin_activity_logs (
+                id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
+                admin_user_id {user_id_type} NOT NULL REFERENCES users(id),
+                action TEXT NOT NULL,
+                record_type TEXT,
+                record_id TEXT,
+                details TEXT NOT NULL DEFAULT '{{}}',
+                created_at TEXT NOT NULL
+            )
+        """)
+        _execute(connection, "CREATE INDEX IF NOT EXISTS admin_activity_created_idx ON admin_activity_logs (created_at DESC)")
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS platform_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
+                updated_by {user_id_type} REFERENCES users(id),
+                updated_at TEXT NOT NULL
+            )
+        """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS user_feedback (
+                id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
+                user_id {user_id_type} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                category TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        _execute(connection, f"""
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id {"BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"},
+                symbol TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                setup_status TEXT NOT NULL,
+                entry_price DOUBLE PRECISION,
+                stop_loss DOUBLE PRECISION,
+                target_price DOUBLE PRECISION,
+                data_source TEXT NOT NULL,
+                bar_time TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(symbol, strategy, timeframe, bar_time)
+            )
+        """)
+        _execute(connection, "CREATE INDEX IF NOT EXISTS signal_history_created_idx ON signal_history (created_at DESC)")
 
 
 _initialize_auth_db()
@@ -595,7 +682,7 @@ def login(payload: LoginPayload, request: Request, response: Response):
     with _auth_connection() as connection:
         user = _execute(
             connection,
-            "SELECT id, username, password_salt, password_hash FROM users WHERE LOWER(username) = LOWER(?)",
+            "SELECT id, username, password_salt, password_hash, role, account_status FROM users WHERE LOWER(username) = LOWER(?)",
             (username,),
         ).fetchone()
         if user is None or not hmac.compare_digest(
@@ -603,9 +690,13 @@ def login(payload: LoginPayload, request: Request, response: Response):
             user["password_hash"],
         ):
             raise HTTPException(status_code=401, detail="Username or password is incorrect.")
+        if user["account_status"] != "ACTIVE":
+            raise HTTPException(status_code=403, detail="This account is suspended. Contact TradeMind support.")
         token = _new_session(connection, int(user["id"]))
+        if user["role"] == "ADMIN":
+            _record_admin_activity(connection, int(user["id"]), "ADMIN_LOGIN", "user", user["id"], {"username": user["username"]})
     _set_session_cookie(response, request, token)
-    return {"username": user["username"]}
+    return {"user_id": int(user["id"]), "username": user["username"], "role": user["role"]}
 
 
 @app.get("/api/auth/me")
@@ -617,7 +708,7 @@ def current_user(request: Request, response: Response, authorization: str | None
         user = _execute(
             connection,
             """
-            SELECT users.username, auth_sessions.expires_at
+            SELECT users.id, users.username, users.role, users.account_status, auth_sessions.expires_at
             FROM auth_sessions JOIN users ON users.id = auth_sessions.user_id
             WHERE auth_sessions.token_hash = ?
             """,
@@ -626,9 +717,11 @@ def current_user(request: Request, response: Response, authorization: str | None
         if user is None or user["expires_at"] <= now:
             _execute(connection, "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+        if user["account_status"] != "ACTIVE":
+            raise HTTPException(status_code=403, detail="This account is suspended.")
     if not request.cookies.get("trademind_session") and authorization:
         _set_session_cookie(response, request, token)
-    return {"username": user["username"]}
+    return {"user_id": int(user["id"]), "username": user["username"], "role": user["role"]}
 
 
 def verify_email(payload: TokenPayload, request: Request):
@@ -759,10 +852,406 @@ def _authenticated_user_id(authorization: str | None) -> int:
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc).isoformat()
     with _auth_connection() as connection:
-        session = _execute(connection, "SELECT user_id, expires_at FROM auth_sessions WHERE token_hash = ?", (token_hash,)).fetchone()
+        session = _execute(connection, """
+            SELECT auth_sessions.user_id, auth_sessions.expires_at, users.account_status
+            FROM auth_sessions JOIN users ON users.id = auth_sessions.user_id
+            WHERE auth_sessions.token_hash = ?
+        """, (token_hash,)).fetchone()
     if session is None or session["expires_at"] <= now:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    if session["account_status"] != "ACTIVE":
+        raise HTTPException(status_code=403, detail="This account is suspended.")
     return int(session["user_id"])
+
+
+def _record_admin_activity(connection, admin_user_id, action, record_type=None, record_id=None, details=None):
+    _execute(connection, """
+        INSERT INTO admin_activity_logs (admin_user_id, action, record_type, record_id, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        admin_user_id,
+        action,
+        record_type,
+        str(record_id) if record_id is not None else None,
+        json.dumps(details or {}),
+        datetime.now(timezone.utc).isoformat(),
+    ))
+
+
+def _require_admin(authorization: str | None) -> int:
+    user_id = _authenticated_user_id(authorization)
+    with _auth_connection() as connection:
+        user = _execute(connection, "SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user is None or user["role"] != "ADMIN":
+        raise HTTPException(status_code=403, detail="Administrator access required.")
+    return user_id
+
+
+def _admin_strategy_record(row):
+    strategy = _strategy_record(row)
+    strategy.update({"owner_user_id": int(row["user_id"]), "owner_username": row["owner_username"], "published": bool(row["published"])})
+    return strategy
+
+
+ADMIN_RISK_DEFAULTS = {
+    "risk_per_trade_pct": 1,
+    "daily_loss_pct": 2,
+    "max_drawdown_pct": 8,
+    "max_open_risk_pct": 3,
+    "supported_instruments": ["NIFTY 50", "BTC/USDT", "GOLD"],
+    "supported_timeframes": ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"],
+}
+
+
+@app.get("/api/admin/overview")
+def admin_overview(authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    with _auth_connection() as connection:
+        users = _execute(connection, """
+            SELECT COUNT(*) AS total,
+                SUM(CASE WHEN account_status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN account_status = 'SUSPENDED' THEN 1 ELSE 0 END) AS suspended
+            FROM users
+        """).fetchone()
+        strategies = _execute(connection, """
+            SELECT COUNT(*) AS total,
+                SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN published = 1 THEN 1 ELSE 0 END) AS published
+            FROM strategies
+        """).fetchone()
+        signal_count = _execute(connection, "SELECT COUNT(*) AS total FROM signal_history").fetchone()["total"]
+        activity = _execute(connection, """
+            SELECT logs.id, logs.admin_user_id, users.username AS admin_username, logs.action,
+                logs.record_type, logs.record_id, logs.details, logs.created_at
+            FROM admin_activity_logs AS logs
+            JOIN users ON users.id = logs.admin_user_id
+            ORDER BY logs.created_at DESC LIMIT 8
+        """).fetchall()
+    return {
+        "admin_id": admin_id,
+        "users": {"total": int(users["total"] or 0), "active": int(users["active"] or 0), "suspended": int(users["suspended"] or 0)},
+        "strategies": {"total": int(strategies["total"] or 0), "active": int(strategies["active"] or 0), "published": int(strategies["published"] or 0)},
+        "signals": {"total": int(signal_count or 0)},
+        "recent_activity": [{**dict(row), "details": json.loads(row["details"])} for row in activity],
+    }
+
+
+@app.get("/api/admin/users")
+def admin_list_users(
+    query: str = Query(default="", max_length=80),
+    role: str | None = Query(default=None, pattern="^(USER|ADMIN)$"),
+    account_status: str | None = Query(default=None, pattern="^(ACTIVE|SUSPENDED)$"),
+    authorization: str | None = Header(default=None),
+):
+    _require_admin(authorization)
+    clauses = []
+    parameters = []
+    if query.strip():
+        clauses.append("(LOWER(username) LIKE LOWER(?) OR CAST(id AS TEXT) LIKE ?)")
+        parameters.extend((f"%{query.strip()}%", f"%{query.strip()}%"))
+    if role:
+        clauses.append("role = ?")
+        parameters.append(role)
+    if account_status:
+        clauses.append("account_status = ?")
+        parameters.append(account_status)
+    where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _auth_connection() as connection:
+        rows = _execute(connection, f"""
+            SELECT users.id, users.username, users.created_at, users.role, users.account_status,
+                (SELECT COUNT(*) FROM strategies WHERE strategies.user_id = users.id) AS strategy_count,
+                (SELECT COUNT(*) FROM backtest_runs WHERE backtest_runs.user_id = users.id) AS backtest_count
+            FROM users {where_clause} ORDER BY users.created_at DESC LIMIT 250
+        """, tuple(parameters)).fetchall()
+    return [{**dict(row), "id": int(row["id"])} for row in rows]
+
+
+@app.get("/api/admin/users/{user_id}")
+def admin_user_details(user_id: int, authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    with _auth_connection() as connection:
+        user = _execute(connection, """
+            SELECT id, username, created_at, role, account_status FROM users WHERE id = ?
+        """, (user_id,)).fetchone()
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        activity = _execute(connection, """
+            SELECT id, admin_user_id, action, record_type, record_id, details, created_at
+            FROM admin_activity_logs WHERE record_type = 'user' AND record_id = ?
+            ORDER BY created_at DESC LIMIT 20
+        """, (str(user_id),)).fetchall()
+        feedback_count = _execute(connection, "SELECT COUNT(*) AS total FROM user_feedback WHERE user_id = ?", (user_id,)).fetchone()["total"]
+    return {
+        **dict(user),
+        "id": int(user["id"]),
+        "feedback_count": int(feedback_count or 0),
+        "admin_activity": [{**dict(row), "details": json.loads(row["details"])} for row in activity],
+    }
+
+
+@app.put("/api/admin/users/{user_id}")
+def admin_update_user(user_id: int, payload: AdminUserUpdatePayload, authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    if payload.role is None and payload.account_status is None:
+        raise HTTPException(status_code=422, detail="Provide a role or account status change.")
+    if admin_id == user_id:
+        raise HTTPException(status_code=409, detail="Administrators cannot change their own role or account status.")
+    with _auth_connection() as connection:
+        target = _execute(connection, "SELECT id, username, role, account_status FROM users WHERE id = ?", (user_id,)).fetchone()
+        if target is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        removes_admin_access = target["role"] == "ADMIN" and (
+            payload.role == "USER" or payload.account_status == "SUSPENDED"
+        )
+        if removes_admin_access:
+            other_admins = _execute(connection, """
+                SELECT COUNT(*) AS total FROM users
+                WHERE role = 'ADMIN' AND account_status = 'ACTIVE' AND id <> ?
+            """, (user_id,)).fetchone()["total"]
+            if int(other_admins or 0) == 0:
+                raise HTTPException(status_code=409, detail="The last active administrator cannot be demoted or suspended.")
+        if payload.role is not None and payload.role != target["role"]:
+            _execute(connection, "UPDATE users SET role = ? WHERE id = ?", (payload.role, user_id))
+            _record_admin_activity(connection, admin_id, "USER_ROLE_CHANGED", "user", user_id, {"username": target["username"], "from": target["role"], "to": payload.role})
+        if payload.account_status is not None and payload.account_status != target["account_status"]:
+            _execute(connection, "UPDATE users SET account_status = ? WHERE id = ?", (payload.account_status, user_id))
+            action = "USER_SUSPENDED" if payload.account_status == "SUSPENDED" else "USER_RESTORED"
+            _record_admin_activity(connection, admin_id, action, "user", user_id, {"username": target["username"]})
+        updated = _execute(connection, "SELECT id, username, created_at, role, account_status FROM users WHERE id = ?", (user_id,)).fetchone()
+    return {**dict(updated), "id": int(updated["id"])}
+
+
+@app.get("/api/admin/strategies")
+def admin_list_strategies(authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(connection, """
+            SELECT strategies.*, users.username AS owner_username,
+                (SELECT COUNT(*) FROM backtest_runs WHERE backtest_runs.strategy_id = strategies.id) AS backtest_count,
+                (SELECT COUNT(*) FROM signal_history WHERE signal_history.strategy = strategies.name) AS signal_count
+            FROM strategies JOIN users ON users.id = strategies.user_id
+            ORDER BY strategies.updated_at DESC LIMIT 500
+        """).fetchall()
+    result = []
+    for row in rows:
+        strategy = _admin_strategy_record(row)
+        strategy["backtest_count"] = int(row["backtest_count"] or 0)
+        strategy["signal_count"] = int(row["signal_count"] or 0)
+        result.append(strategy)
+    return result
+
+
+@app.post("/api/admin/strategies", status_code=201)
+def admin_create_strategy(payload: AdminStrategyPayload, authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    _validate_strategy_payload(payload)
+    definition = payload.model_dump(exclude={"published"})
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        if DATABASE_URL:
+            row = _execute(connection, """
+                INSERT INTO strategies (user_id, name, description, category, symbol, timeframe, direction, definition, version, active, published, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?) RETURNING id
+            """, (admin_id, payload.name.strip(), payload.description, payload.category, payload.symbol,
+                  payload.timeframe, payload.direction, json.dumps(definition), int(payload.active), int(payload.published), now, now)).fetchone()
+            strategy_id = int(row["id"])
+        else:
+            cursor = _execute(connection, """
+                INSERT INTO strategies (user_id, name, description, category, symbol, timeframe, direction, definition, version, active, published, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            """, (admin_id, payload.name.strip(), payload.description, payload.category, payload.symbol,
+                  payload.timeframe, payload.direction, json.dumps(definition), int(payload.active), int(payload.published), now, now))
+            strategy_id = int(cursor.lastrowid)
+        _execute(connection, "INSERT INTO strategy_versions (strategy_id, version, definition, created_at) VALUES (?, 1, ?, ?)", (strategy_id, json.dumps(definition), now))
+        _record_admin_activity(connection, admin_id, "STRATEGY_CREATED", "strategy", strategy_id, {"name": payload.name, "published": payload.published})
+        row = _execute(connection, """
+            SELECT strategies.*, users.username AS owner_username FROM strategies JOIN users ON users.id = strategies.user_id WHERE strategies.id = ?
+        """, (strategy_id,)).fetchone()
+    return _admin_strategy_record(row)
+
+
+@app.put("/api/admin/strategies/{strategy_id}")
+def admin_update_strategy(strategy_id: int, payload: AdminStrategyPayload, authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    _validate_strategy_payload(payload)
+    definition = payload.model_dump(exclude={"published"})
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        existing = _execute(connection, "SELECT version, name, published FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Strategy not found.")
+        version = int(existing["version"]) + 1
+        _execute(connection, """
+            UPDATE strategies SET name = ?, description = ?, category = ?, symbol = ?, timeframe = ?, direction = ?,
+                definition = ?, version = ?, active = ?, published = ?, updated_at = ? WHERE id = ?
+        """, (payload.name.strip(), payload.description, payload.category, payload.symbol, payload.timeframe,
+              payload.direction, json.dumps(definition), version, int(payload.active), int(payload.published), now, strategy_id))
+        _execute(connection, "INSERT INTO strategy_versions (strategy_id, version, definition, created_at) VALUES (?, ?, ?, ?)", (strategy_id, version, json.dumps(definition), now))
+        _record_admin_activity(connection, admin_id, "STRATEGY_UPDATED", "strategy", strategy_id, {"name": payload.name, "version": version})
+        if bool(existing["published"]) != payload.published:
+            _record_admin_activity(connection, admin_id, "STRATEGY_PUBLICATION_CHANGED", "strategy", strategy_id, {"published": payload.published})
+        row = _execute(connection, """
+            SELECT strategies.*, users.username AS owner_username FROM strategies JOIN users ON users.id = strategies.user_id WHERE strategies.id = ?
+        """, (strategy_id,)).fetchone()
+    return _admin_strategy_record(row)
+
+
+@app.delete("/api/admin/strategies/{strategy_id}", status_code=204)
+def admin_delete_strategy(strategy_id: int, authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    with _auth_connection() as connection:
+        row = _execute(connection, "SELECT name FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Strategy not found.")
+        _record_admin_activity(connection, admin_id, "STRATEGY_DELETED", "strategy", strategy_id, {"name": row["name"]})
+        _execute(connection, "DELETE FROM strategies WHERE id = ?", (strategy_id,))
+    return None
+
+
+@app.get("/api/admin/signals")
+def admin_signals(authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    current = []
+    for symbol in ("NIFTY 50", "BTC/USDT", "GOLD"):
+        try:
+            frame, live = market_frame(symbol, 200, live=True, interval="5m")
+            if not live:
+                current.append({"symbol": symbol, "strategy": "EMA Trend Pullback", "timeframe": "5m", "signal": "NO DATA", "setup_status": "PROVIDER_UNAVAILABLE", "entry_price": None, "stop_loss": None, "target_price": None, "data_source": "Not connected; synthetic demo data not used", "created_at": None})
+                continue
+            result = generate_signal(frame, "ema_trend_pullback")
+            bar_time = pd.Timestamp(frame.time.iloc[-1]).isoformat()
+            signal_value = str(result.get("signal", "WAIT"))
+            data_source = "Yahoo Finance chart history (delay possible)"
+            created_at = datetime.now(timezone.utc).isoformat()
+            with _auth_connection() as connection:
+                _execute(connection, """
+                    INSERT INTO signal_history (symbol, strategy, timeframe, signal, setup_status, entry_price, stop_loss, target_price, data_source, bar_time, created_at)
+                    VALUES (?, ?, '5m', ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(symbol, strategy, timeframe, bar_time) DO NOTHING
+                """, (symbol, "EMA Trend Pullback", signal_value, str(result.get("setup_status", "READY")), result.get("entry_price"),
+                      result.get("stop_loss"), result.get("target_price"), data_source, bar_time, created_at))
+            current.append({"symbol": symbol, "strategy": "EMA Trend Pullback", "timeframe": "5m", "signal": signal_value,
+                "setup_status": result.get("setup_status", "READY"), "entry_price": result.get("entry_price"),
+                "stop_loss": result.get("stop_loss"), "target_price": result.get("target_price"), "data_source": data_source, "created_at": bar_time})
+        except Exception as error:
+            logger.warning("Admin signal check failed symbol=%s error_type=%s", symbol, type(error).__name__)
+            current.append({"symbol": symbol, "strategy": "EMA Trend Pullback", "timeframe": "5m", "signal": "ERROR", "setup_status": "PROVIDER_ERROR", "entry_price": None, "stop_loss": None, "target_price": None, "data_source": "Unavailable", "created_at": None})
+    with _auth_connection() as connection:
+        history = _execute(connection, "SELECT * FROM signal_history ORDER BY created_at DESC LIMIT 50").fetchall()
+    return {"current": current, "history": [dict(row) for row in history]}
+
+
+@app.get("/api/admin/backtests")
+def admin_backtests(authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(connection, """
+            SELECT backtest_runs.*, users.username FROM backtest_runs
+            JOIN users ON users.id = backtest_runs.user_id
+            ORDER BY backtest_runs.created_at DESC LIMIT 250
+        """).fetchall()
+    return [{
+        "id": int(row["id"]), "user_id": int(row["user_id"]), "username": row["username"],
+        "strategy_id": row["strategy_id"], "strategy_name": row["strategy_name"],
+        "strategy_version": int(row["strategy_version"]), "strategy_snapshot": json.loads(row["strategy_snapshot"]),
+        "result": json.loads(row["result"]), "created_at": row["created_at"],
+    } for row in rows]
+
+
+@app.post("/api/feedback", status_code=201)
+def submit_feedback(payload: UserFeedbackPayload, authorization: str | None = Header(default=None)):
+    user_id = _authenticated_user_id(authorization)
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        if DATABASE_URL:
+            row = _execute(connection, """
+                INSERT INTO user_feedback (user_id, category, subject, message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?) RETURNING id
+            """, (user_id, payload.category.strip(), payload.subject.strip(), payload.message.strip(), now, now)).fetchone()
+            feedback_id = int(row["id"])
+        else:
+            cursor = _execute(connection, """
+                INSERT INTO user_feedback (user_id, category, subject, message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, payload.category.strip(), payload.subject.strip(), payload.message.strip(), now, now))
+            feedback_id = int(cursor.lastrowid)
+    return {"id": feedback_id, "status": "OPEN", "message": "Feedback received."}
+
+
+@app.get("/api/admin/feedback")
+def admin_list_feedback(status: str | None = Query(default=None, pattern="^(OPEN|IN_REVIEW|RESOLVED)$"), authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(connection, """
+            SELECT feedback.id, feedback.user_id, users.username, feedback.category, feedback.subject,
+                feedback.message, feedback.status, feedback.created_at, feedback.updated_at
+            FROM user_feedback AS feedback JOIN users ON users.id = feedback.user_id
+            WHERE (? IS NULL OR feedback.status = ?)
+            ORDER BY feedback.created_at DESC LIMIT 250
+        """, (status, status)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.put("/api/admin/feedback/{feedback_id}")
+def admin_update_feedback(feedback_id: int, payload: AdminFeedbackUpdatePayload, authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    now = datetime.now(timezone.utc).isoformat()
+    with _auth_connection() as connection:
+        row = _execute(connection, "SELECT id, status FROM user_feedback WHERE id = ?", (feedback_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Feedback item not found.")
+        _execute(connection, "UPDATE user_feedback SET status = ?, updated_at = ? WHERE id = ?", (payload.status, now, feedback_id))
+        _record_admin_activity(connection, admin_id, "FEEDBACK_STATUS_CHANGED", "feedback", feedback_id, {"from": row["status"], "to": payload.status})
+    return {"id": feedback_id, "status": payload.status, "updated_at": now}
+
+
+@app.get("/api/admin/settings")
+def admin_get_settings(authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    with _auth_connection() as connection:
+        user = _execute(connection, "SELECT id, username, role FROM users WHERE id = ?", (admin_id,)).fetchone()
+        row = _execute(connection, "SELECT setting_value, updated_at FROM platform_settings WHERE setting_key = 'risk_defaults'").fetchone()
+    return {"admin_profile": dict(user), "settings": json.loads(row["setting_value"]) if row else ADMIN_RISK_DEFAULTS, "updated_at": row["updated_at"] if row else None}
+
+
+@app.put("/api/admin/settings")
+def admin_update_settings(payload: AdminSettingsPayload, authorization: str | None = Header(default=None)):
+    admin_id = _require_admin(authorization)
+    settings = {**ADMIN_RISK_DEFAULTS, **payload.settings}
+    try:
+        for key in ("risk_per_trade_pct", "daily_loss_pct", "max_drawdown_pct", "max_open_risk_pct"):
+            value = float(settings[key])
+            if not math.isfinite(value) or value <= 0 or value > 100:
+                raise ValueError(f"{key} must be greater than zero and at most 100.")
+            settings[key] = value
+        for key in ("supported_instruments", "supported_timeframes"):
+            value = settings[key]
+            if not isinstance(value, list) or not value or any(not isinstance(item, str) or not item.strip() for item in value):
+                raise ValueError(f"{key} must be a non-empty list of names.")
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error) or "Platform settings are invalid.") from None
+    now = datetime.now(timezone.utc).isoformat()
+    value = json.dumps(settings)
+    with _auth_connection() as connection:
+        exists = _execute(connection, "SELECT setting_key FROM platform_settings WHERE setting_key = 'risk_defaults'").fetchone()
+        if exists:
+            _execute(connection, "UPDATE platform_settings SET setting_value = ?, updated_by = ?, updated_at = ? WHERE setting_key = 'risk_defaults'", (value, admin_id, now))
+        else:
+            _execute(connection, "INSERT INTO platform_settings (setting_key, setting_value, updated_by, updated_at) VALUES ('risk_defaults', ?, ?, ?)", (value, admin_id, now))
+        _record_admin_activity(connection, admin_id, "PLATFORM_RISK_SETTINGS_CHANGED", "settings", "risk_defaults", settings)
+    return {"settings": settings, "updated_at": now}
+
+
+@app.get("/api/admin/activity")
+def admin_activity(authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    with _auth_connection() as connection:
+        rows = _execute(connection, """
+            SELECT logs.id, logs.admin_user_id, users.username AS admin_username, logs.action,
+                logs.record_type, logs.record_id, logs.details, logs.created_at
+            FROM admin_activity_logs AS logs JOIN users ON users.id = logs.admin_user_id
+            ORDER BY logs.created_at DESC LIMIT 250
+        """).fetchall()
+    return [{**dict(row), "details": json.loads(row["details"])} for row in rows]
 
 
 def _strategy_record(row):
@@ -774,6 +1263,7 @@ def _strategy_record(row):
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "rule": "custom",
+        "published": bool(row["published"]),
     }
 
 
@@ -799,7 +1289,7 @@ def _validate_strategy_payload(payload: StrategyPayload):
 def list_strategies(authorization: str | None = Header(default=None)):
     user_id = _authenticated_user_id(authorization)
     with _auth_connection() as connection:
-        rows = _execute(connection, "SELECT * FROM strategies WHERE user_id = ? ORDER BY updated_at DESC", (user_id,)).fetchall()
+        rows = _execute(connection, "SELECT * FROM strategies WHERE user_id = ? OR published = 1 ORDER BY updated_at DESC", (user_id,)).fetchall()
         run_rows = _execute(connection, "SELECT strategy_id, strategy_name, result, created_at FROM backtest_runs WHERE user_id = ? ORDER BY created_at DESC", (user_id,)).fetchall()
     latest_by_id = {}
     counts_by_id = {}
@@ -1279,7 +1769,10 @@ def signal(
     if strategy_id is not None:
         user_id = _authenticated_user_id(authorization)
         with _auth_connection() as connection:
-            saved_strategy = _execute(connection, "SELECT * FROM strategies WHERE id = ? AND user_id = ? AND active = 1", (strategy_id, user_id)).fetchone()
+            saved_strategy = _execute(connection, """
+                SELECT * FROM strategies
+                WHERE id = ? AND active = 1 AND (user_id = ? OR published = 1)
+            """, (strategy_id, user_id)).fetchone()
         if saved_strategy is None:
             raise HTTPException(status_code=404, detail="Active custom strategy not found.")
         strategy = saved_strategy["name"]
@@ -1343,7 +1836,10 @@ def backtest(
     if strategy_id is not None:
         user_id = _authenticated_user_id(authorization)
         with _auth_connection() as connection:
-            saved_strategy = _execute(connection, "SELECT * FROM strategies WHERE id = ? AND user_id = ?", (strategy_id, user_id)).fetchone()
+            saved_strategy = _execute(connection, """
+                SELECT * FROM strategies
+                WHERE id = ? AND (user_id = ? OR (published = 1 AND active = 1))
+            """, (strategy_id, user_id)).fetchone()
         if saved_strategy is None:
             raise HTTPException(status_code=404, detail="Custom strategy not found.")
         strategy_name = saved_strategy["name"]

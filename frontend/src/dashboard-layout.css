@@ -62,6 +62,20 @@
   text-decoration: underline;
 }
 
+.supportFeedback {
+  align-self: flex-start;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: #79bdff;
+  font-size: 10px;
+  text-align: left;
+}
+
+.supportFeedback:hover {
+  text-decoration: underline;
+}
+
 main {
   width: calc(100% - var(--sidebar-width, 245px));
   margin-left: var(--sidebar-width, 245px);
@@ -512,7 +526,9 @@ main {
   font-size: 11px;
 }
 
-.profileDialog input {
+.profileDialog input,
+.profileDialog select,
+.profileDialog textarea {
   display: block;
   width: 100%;
   margin-top: 7px;
@@ -521,6 +537,17 @@ main {
   border-radius: 6px;
   background: #101a26;
   color: #f3f7ff;
+}
+
+.profileDialog textarea {
+  resize: vertical;
+  font: inherit;
+  font-size: 12px;
+}
+
+.feedbackSuccess {
+  color: #52d7a2;
+  font-size: 11px;
 }
 
 .profilePrivacyNote {

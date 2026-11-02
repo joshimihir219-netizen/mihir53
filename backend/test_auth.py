@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import psycopg
+import pandas as pd
 
 
 _original_environment = {}
@@ -16,6 +17,7 @@ for _key in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_URL_NON_POOLING", "VERCEL
 _startup_directory = tempfile.TemporaryDirectory()
 os.environ["TRADEMIND_AUTH_DB"] = str(Path(_startup_directory.name) / "startup.sqlite3")
 import main
+import promote_admin
 os.environ.pop("TRADEMIND_AUTH_DB", None)
 for _key, _value in _original_environment.items():
     if _value is not None:
@@ -62,7 +64,7 @@ class AuthenticationFlowTests(unittest.TestCase):
         })
         self.assertEqual(login.status_code, 200)
         self.assertIn("httponly", login.headers["set-cookie"].lower())
-        self.assertEqual(self.client.get("/api/auth/me").json(), {"username": "marketpilot"})
+        self.assertEqual(self.client.get("/api/auth/me").json(), {"user_id": 1, "username": "marketpilot", "role": "USER"})
 
     def test_duplicate_username_is_rejected_case_insensitively(self):
         self.assertEqual(self.register().status_code, 201)
@@ -227,7 +229,10 @@ class AuthenticationFlowTests(unittest.TestCase):
 
     def test_settings_and_manual_positions_persist_per_user(self):
         self.login_user()
-        saved = self.client.put("/api/risk/settings", json={"settings": self.risk_settings()})
+        saved = self.client.put("/api/risk/settings", json={"settings": self.risk_settings(
+            accountEquity="10000.25", capitalBox="10000.25", riskPerTradePct="0.5",
+            riskPerTrade="0.5", dailyLossValue="500.50", dailyLoss="500.50",
+        )})
         self.assertEqual(saved.status_code, 200)
         position = self.client.post("/api/risk/positions", json={
             "instrument": "Example spot",
@@ -245,7 +250,7 @@ class AuthenticationFlowTests(unittest.TestCase):
         self.assertEqual(position.status_code, 201)
         self.assertEqual(position.json()["risk_amount"], 50)
         self.assertEqual(len(self.client.get("/api/risk/positions").json()), 1)
-        self.assertEqual(self.client.get("/api/risk/settings").json()["accountEquity"], "10000")
+        self.assertEqual(self.client.get("/api/risk/settings").json()["accountEquity"], "10000.25")
         self.assertEqual(self.client.get("/api/risk/status").json()["current_open_risk"], 50)
 
         second_client = TestClient(main.app)
@@ -321,6 +326,136 @@ class AuthenticationFlowTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 422)
         self.assertIn("not directly tradable", response.json()["detail"])
+
+    def test_normal_users_are_denied_from_all_admin_apis(self):
+        self.login_user()
+        paths = [
+            "/api/admin/overview", "/api/admin/users", "/api/admin/strategies",
+            "/api/admin/signals", "/api/admin/backtests", "/api/admin/feedback",
+            "/api/admin/settings", "/api/admin/activity",
+        ]
+        self.assertTrue(all(self.client.get(path).status_code == 403 for path in paths))
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.get("/api/admin/overview").status_code, 401)
+
+    def test_first_admin_bootstrap_and_admin_pages_use_database_records(self):
+        self.login_user()
+        self.assertEqual(promote_admin.promote_first_admin("marketpilot"), "marketpilot")
+        overview = self.client.get("/api/admin/overview")
+        self.assertEqual(overview.status_code, 200)
+        self.assertEqual(overview.json()["admin_id"], 1)
+        self.assertEqual(overview.json()["users"]["total"], 1)
+        self.assertEqual(overview.json()["signals"]["total"], 0)
+        self.assertEqual(self.client.get("/api/admin/backtests").json(), [])
+        self.assertEqual(self.client.get("/api/admin/users").json()[0]["role"], "ADMIN")
+        self.assertEqual(self.client.get("/api/admin/settings").json()["admin_profile"]["username"], "marketpilot")
+        self.assertEqual(self.client.get("/api/admin/activity").json()[0]["action"], "ADMIN_BOOTSTRAPPED")
+        self.assertEqual(self.client.put("/api/admin/users/1", json={"role": "USER"}).status_code, 409)
+        with self.assertRaisesRegex(RuntimeError, "administrator already exists"):
+            promote_admin.promote_first_admin("marketpilot")
+
+    def test_admin_strategy_publication_user_status_feedback_and_audit(self):
+        self.login_user()
+        promote_admin.promote_first_admin("marketpilot")
+        strategy_payload = {
+            "name": "Managed Trend Rule",
+            "description": "Admin-managed test rule.",
+            "category": "Trend",
+            "symbol": "NIFTY 50",
+            "timeframe": "15m",
+            "direction": "Long",
+            "entry": {"logic": "AND", "conditions": [{"left": {"indicator": "CLOSE"}, "operator": "gt", "right": {"indicator": "EMA", "period": 20}}]},
+            "exit": {"logic": "OR", "conditions": [{"left": {"indicator": "CLOSE"}, "operator": "lt", "right": {"indicator": "EMA", "period": 20}}]},
+            "risk_settings": {"stop_loss_pct": 1.5, "target_r": 2},
+            "active": True,
+            "published": True,
+        }
+        created = self.client.post("/api/admin/strategies", json=strategy_payload)
+        self.assertEqual(created.status_code, 201, created.text)
+        strategy_id = created.json()["id"]
+
+        second_client = TestClient(main.app)
+        try:
+            second_client.post("/api/auth/signup", json={
+                "username": "secondpilot",
+                "password": "MarketPilot!42",
+                "confirm_password": "MarketPilot!42",
+            })
+            second_client.post("/api/auth/login", json={"username": "secondpilot", "password": "MarketPilot!42"})
+            self.assertEqual(second_client.get("/api/strategies").json()[0]["published"], True)
+            self.assertEqual(second_client.get("/api/admin/overview").status_code, 403)
+            sample_frame = pd.DataFrame({"time": pd.date_range(pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=12), periods=2, freq="6h")})
+            with patch.object(main, "market_frame", return_value=(sample_frame, True)), patch.object(main, "generate_signal", return_value={"signal": "BUY"}), patch.object(main, "run_backtest", return_value={"pnl": 0}):
+                signal_response = second_client.get("/api/signal/NIFTY 50", params={"strategy_id": strategy_id})
+                backtest_response = second_client.post("/api/backtest", params={"strategy_id": strategy_id, "timeframe": "1d", "duration": 1})
+            self.assertEqual(signal_response.status_code, 200, signal_response.text)
+            self.assertEqual(signal_response.json()["strategy"], "Managed Trend Rule")
+            self.assertEqual(backtest_response.status_code, 200, backtest_response.text)
+            feedback = second_client.post("/api/feedback", json={
+                "category": "Bug", "subject": "Strategy display", "message": "The published rule should show its description.",
+            })
+            self.assertEqual(feedback.status_code, 201)
+
+            update = self.client.put(f"/api/admin/strategies/{strategy_id}", json={**strategy_payload, "published": False})
+            self.assertEqual(update.status_code, 200)
+            self.assertFalse(update.json()["published"])
+            self.assertEqual(second_client.get("/api/strategies").json(), [])
+
+            users = self.client.get("/api/admin/users?query=secondpilot").json()
+            target = users[0]
+            role_change = self.client.put(f"/api/admin/users/{target['id']}", json={"role": "ADMIN"})
+            self.assertEqual(role_change.status_code, 200)
+            suspension = self.client.put(f"/api/admin/users/{target['id']}", json={"account_status": "SUSPENDED"})
+            self.assertEqual(suspension.status_code, 200)
+            self.assertEqual(second_client.get("/api/auth/me").status_code, 403)
+
+            inbox = self.client.get("/api/admin/feedback").json()
+            self.assertEqual(inbox[0]["subject"], "Strategy display")
+            updated_feedback = self.client.put(f"/api/admin/feedback/{feedback.json()['id']}", json={"status": "RESOLVED"})
+            self.assertEqual(updated_feedback.json()["status"], "RESOLVED")
+            self.assertGreaterEqual(len(self.client.get("/api/admin/activity").json()), 5)
+        finally:
+            second_client.close()
+
+        deleted = self.client.delete(f"/api/admin/strategies/{strategy_id}")
+        self.assertEqual(deleted.status_code, 204)
+
+    def test_admin_settings_persist_and_signal_page_does_not_invent_live_data(self):
+        self.login_user()
+        promote_admin.promote_first_admin("marketpilot")
+        updated = self.client.put("/api/admin/settings", json={"settings": {
+            "risk_per_trade_pct": 0.5,
+            "daily_loss_pct": 2.5,
+            "max_drawdown_pct": 8,
+            "max_open_risk_pct": 3,
+            "supported_instruments": ["NIFTY 50", "BTC/USDT", "GOLD"],
+            "supported_timeframes": ["1m", "3m", "5m", "15m", "1h", "4h"],
+        }})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(self.client.get("/api/admin/settings").json()["settings"]["risk_per_trade_pct"], 0.5)
+        with patch.object(main, "market_frame", return_value=(None, False)):
+            signals = self.client.get("/api/admin/signals")
+        self.assertEqual(signals.status_code, 200)
+        self.assertEqual([item["signal"] for item in signals.json()["current"]], ["NO DATA"] * 3)
+        self.assertEqual(signals.json()["history"], [])
+
+    def test_backtest_api_accepts_decimal_financial_parameters(self):
+        timestamps = pd.date_range(pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=12), periods=2, freq="6h")
+        frame = pd.DataFrame({"time": timestamps})
+        with patch.object(main, "market_frame", return_value=(frame, True)), patch.object(main, "run_backtest", return_value={"pnl": 0}):
+            response = self.client.post("/api/backtest", params={
+                "symbol": "NIFTY 50",
+                "initial_capital": "10000.01",
+                "timeframe": "1d",
+                "duration": "1",
+                "duration_unit": "days",
+                "strategy": "Price Action Break & Retest",
+                "position_size": "5000.01",
+                "stop_loss_pct": "0.01",
+                "take_profit_rr": "0.5",
+                "fee_bps": "0.01",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
 
 
 if __name__ == "__main__":

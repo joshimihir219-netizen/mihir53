@@ -87,6 +87,24 @@ For Vercel, configure a persistent PostgreSQL connection as `DATABASE_URL` (the 
 
 Run the backend regression suite from `backend/` with `python -m unittest test_auth test_backtest` after installing `requirements.txt`. Tests use temporary SQLite databases and do not modify existing accounts.
 
+## Admin console
+The admin console is available at `/admin` on the same host as TradeMind (for example, `https://your-vercel-domain/admin`; locally, `http://localhost:5173/admin`). It reuses the normal username/password login and server-side session cookie. Only accounts with the database role `ADMIN` can load the console or call `/api/admin/*`; ordinary accounts are returned to the user dashboard.
+
+After deploying the code, the backend applies additive migrations on startup: existing accounts receive the default `USER` role and `ACTIVE` status, existing strategies receive a private/unpublished flag, and admin activity, feedback, signal-history, and platform-settings tables are created if absent. Existing account and strategy data is preserved. No new Vercel environment variable is required beyond the existing persistent `DATABASE_URL` setting.
+
+To promote the first administrator, first create the account through the normal website, then run the CLI against the same database used by Vercel. Set `DATABASE_URL` in your local shell to the existing Neon connection string first; the command refuses to use local SQLite unless explicitly asked:
+
+```bash
+cd backend
+DATABASE_URL="$DATABASE_URL" python promote_admin.py existing_username
+```
+
+For a local-only development account, use `python promote_admin.py --local existing_username`.
+
+The command promotes only an existing active account and refuses to run if any administrator already exists. Keep `DATABASE_URL` in the shell environment; do not put database credentials in source code or commit them. After promotion, sign in with that account and visit `/admin`. Further role changes are available only in the protected user-management screen; administrators cannot change their own role or lock themselves out, and the last active administrator cannot be suspended or demoted.
+
+The console manages existing users, stored strategies and backtests, provider-backed signal checks, platform risk defaults, feedback, and administrator activity. Published strategies appear in users' strategy lists but remain read-only to their owners. Signal snapshots are stored only when real provider candles are available; unavailable markets show `NO DATA`. Feedback is submitted from the user sidebar and can be triaged in the console. Platform risk defaults do not overwrite individual account risk settings.
+
 ## Telegram signal alerts
 After signing in, open the profile settings and enter a Telegram bot token and chat ID, then use **Test Telegram connection** to confirm delivery. Create the bot with Telegram's BotFather and send it `/start` from the target chat before testing; a bot cannot start a private chat on its own. Signal alerts are sent by the backend through the Telegram Bot API when the selected signal changes. Keep the dashboard open and signed in to receive automatic alerts. Telegram settings are stored in this browser, so only save a bot token on a device you trust.
 

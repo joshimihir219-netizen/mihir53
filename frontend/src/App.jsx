@@ -3,6 +3,7 @@ import "./signal-details.css";
 import "./strategy-lab.css";
 import "./auth.css";
 import RiskManagement from "./RiskManagement";
+import AdminPanel from "./AdminPanel";
 import {Line} from "react-chartjs-2";
 import {Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler} from "chart.js";
 import {LayoutDashboard, Activity, FlaskConical, ShieldCheck, FileText, Settings, Bell, Search, Menu, TrendingDown, LogIn, CheckCircle2, Eye, EyeOff} from "lucide-react";
@@ -117,6 +118,9 @@ function passwordStrength(password){
 
 function App(){
   const [page, setPage] = useState("Dashboard");
+  const [appPath, setAppPath] = useState(() => window.location.pathname);
+  const [userRole, setUserRole] = useState("USER");
+  const [userId, setUserId] = useState(null);
   const [symbol, setSymbol] = useState("NIFTY 50");
   const [chartInterval, setChartInterval] = useState(() => {
     try { return JSON.parse(localStorage.getItem("trademind-chart-settings") || "{}").chartInterval || "1d"; } catch { return "1d"; }
@@ -157,6 +161,11 @@ function App(){
     } catch { return {name: "TradeMind User", email: "", phone: "", location: ""}; }
   });
   const [profileOpen, setProfileOpen] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackForm, setFeedbackForm] = useState({category: "Suggestion", subject: "", message: ""});
+  const [feedbackBusy, setFeedbackBusy] = useState(false);
+  const [feedbackError, setFeedbackError] = useState("");
+  const [feedbackNotice, setFeedbackNotice] = useState("");
   const [developerCardOpen, setDeveloperCardOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [selectedNotification, setSelectedNotification] = useState(null);
@@ -205,6 +214,17 @@ function App(){
     return defaultStrategies;
   });
   const [selectedStrategy, setSelectedStrategy] = useState("EMA Trend Pullback");
+  useEffect(() => {
+    const syncPath = () => setAppPath(window.location.pathname);
+    window.addEventListener("popstate", syncPath);
+    return () => window.removeEventListener("popstate", syncPath);
+  }, []);
+
+  function navigatePath(path){
+    window.history.pushState({}, "", path);
+    setAppPath(path);
+  }
+
   useEffect(() => { try { if (backtest) localStorage.setItem("trademind-last-backtest", JSON.stringify(backtest)); } catch {} }, [backtest]);
   const lastSignalTelegramKeyRef = useRef("");
   const pendingSignalTelegramKeyRef = useRef("");
@@ -239,6 +259,12 @@ function App(){
         if (!response.ok) throw new Error("Session expired.");
         const account = await readApiResponse(response, "Could not check your account session.");
         if (cancelled) return;
+        setUserId(account.user_id);
+        setUserRole(account.role || "USER");
+        if (window.location.pathname.startsWith("/admin") && account.role !== "ADMIN") {
+          window.history.replaceState({}, "", "/");
+          setAppPath("/");
+        }
         localStorage.removeItem("trademind-auth-session");
         localStorage.removeItem("trademind-session");
         localStorage.setItem("trademind-user", JSON.stringify({username: account.username}));
@@ -328,6 +354,28 @@ function App(){
     try { localStorage.setItem("trademind-profile", JSON.stringify(savedProfile)); } catch {}
     setProfileOpen(false);
     addLog(cleanedTelegram.botToken && cleanedTelegram.chatId ? "Profile and Telegram alerts saved on this device." : "Profile information saved on this device.", cleanedTelegram.botToken && cleanedTelegram.chatId ? "success" : "info");
+  }
+
+  async function submitFeedback(event){
+    event.preventDefault();
+    setFeedbackBusy(true);
+    setFeedbackError("");
+    try {
+      const response = await fetch(API + "/feedback", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(feedbackForm)
+      });
+      const result = await readApiResponse(response, "Could not submit feedback.");
+      setFeedbackNotice(result.message || "Feedback received.");
+      setFeedbackForm({category: "Suggestion", subject: "", message: ""});
+      addLog("Feedback sent to the TradeMind team.", "success");
+      window.setTimeout(() => { setFeedbackOpen(false); setFeedbackNotice(""); }, 1200);
+    } catch (error) {
+      setFeedbackError(error.message);
+    } finally {
+      setFeedbackBusy(false);
+    }
   }
 
   const notifyTelegram = async (message, settings = telegramConfig) => {
@@ -590,12 +638,35 @@ function App(){
 
   async function runBacktest(customForm = backtestForm){
     setBacktestError("");
-    setBacktest(null);
-    try { localStorage.removeItem("trademind-last-backtest"); } catch {}
     const timeframe = customForm.timeframe || "1d";
     const durationUnit = customForm.durationUnit || "days";
     const maxDuration = maxDurationForUnit(timeframe, durationUnit);
-    const duration = Math.min(maxDuration, Math.max(1, Number(customForm.durationValue) || 1));
+    const durationValue = Number(customForm.durationValue);
+    const initialCapital = Number(customForm.initialCapital);
+    const positionSize = Number(customForm.positionSize);
+    const stopLoss = Number(customForm.stopLoss);
+    const feeBps = Number(customForm.feeBps);
+    const takeProfitValue = customForm.takeProfitRR === "" ? null : Number(customForm.takeProfitRR);
+    const validationMessage = !Number.isInteger(durationValue) || durationValue < 1 || durationValue > maxDuration
+      ? `Duration must be a whole number from 1 to ${maxDuration} ${durationUnit}.`
+      : !Number.isFinite(initialCapital) || initialCapital <= 0
+        ? "Initial capital must be greater than zero."
+        : !Number.isFinite(positionSize) || positionSize <= 0
+          ? "Position budget must be greater than zero."
+          : !Number.isFinite(stopLoss) || stopLoss < 0 || stopLoss > 100
+            ? "Protective stop loss must be between 0 and 100%."
+            : !Number.isFinite(feeBps) || feeBps < 0 || feeBps > 1000
+              ? "Estimated fees must be between 0 and 1,000 basis points."
+              : takeProfitValue !== null && (!Number.isFinite(takeProfitValue) || takeProfitValue <= 0 || takeProfitValue > 100)
+                ? "Take-profit target must be greater than zero and at most 100R."
+                : "";
+    if (validationMessage) {
+      setBacktestError(validationMessage);
+      throw new Error(validationMessage);
+    }
+    setBacktest(null);
+    try { localStorage.removeItem("trademind-last-backtest"); } catch {}
+    const duration = durationValue;
     const form = {...customForm, durationValue: String(duration), durationUnit};
     const configuredStrategy = strategies.find((item) => item.name === form.strategy);
     const params = new URLSearchParams({
@@ -656,6 +727,12 @@ function App(){
         localStorage.removeItem("trademind-auth-session");
         localStorage.removeItem("trademind-session");
         localStorage.setItem("trademind-user", JSON.stringify({username: result.username}));
+        setUserRole(result.role || "USER");
+        setUserId(result.user_id);
+        if (window.location.pathname.startsWith("/admin") && result.role !== "ADMIN") {
+          window.history.replaceState({}, "", "/");
+          setAppPath("/");
+        }
         setProfile((current) => ({
           ...current,
           name: current.name === "TradeMind User" || current.name === loginForm.username ? result.username : current.name
@@ -688,6 +765,12 @@ function App(){
       localStorage.removeItem("trademind-auth-session");
     } catch {}
     setIsLoggedIn(false);
+    setUserRole("USER");
+    setUserId(null);
+    if (window.location.pathname.startsWith("/admin")) {
+      window.history.replaceState({}, "", "/");
+      setAppPath("/");
+    }
     setStrategies(defaultStrategies);
     setSavedBacktests([]);
     setRiskRules({stopLoss: "2.0", maxDrawdown: "8.0", dailyLoss: "5000", capitalBox: "250000", riskPerTrade: "1", minimumRiskReward: "2", maxTradesPerDay: "5"});
@@ -786,6 +869,14 @@ function App(){
     return <div className="loginShell"><div className="loginCard"><p role="status">Checking your account session…</p></div></div>;
   }
 
+  if (isLoggedIn && appPath.startsWith("/admin")) {
+    if (userRole !== "ADMIN") {
+      return <div className="loginShell"><div className="loginCard"><h1>Access denied</h1><p>Your account does not have administrator access.</p><button className="primary" onClick={() => navigatePath("/")}>Return to TradeMind</button></div></div>;
+    }
+    const savedUser = JSON.parse(localStorage.getItem("trademind-user") || "null");
+    return <AdminPanel username={savedUser?.username || profile.name} currentAdminId={userId} onLogout={handleLogout} onReturnToWebsite={() => navigatePath("/")} onAccessDenied={() => {setUserRole("USER"); navigatePath("/");}} />;
+  }
+
   if (!isLoggedIn) {
     const strength = passwordStrength(loginForm.password);
     return (
@@ -842,11 +933,13 @@ function App(){
         {workspaceNav.map(([name, Icon]) => <button key={name} className={page === name ? "nav active" : "nav"} onClick={() => setPage(name)}><Icon size={18} />{name}</button>)}
         <div className="sectionLabel analysisSectionLabel">ANALYSIS</div>
         {analysisNav.map(([name, Icon]) => <button key={name} className={page === name ? "nav active" : "nav"} onClick={() => setPage(name)}><Icon size={18} />{name}</button>)}
+        {userRole === "ADMIN" && <button className="nav adminEntry" onClick={() => navigatePath("/admin")}><ShieldCheck size={18} />Admin Panel</button>}
         <div className="sidebarBottom">
           <div className="riskMini"><span>●</span> System online<small>Market data connected</small></div>
           <div className="supportContact">
             <span>Need help?</span>
             <a href="mailto:fultonskipz44@gmail.com">fultonskipz44@gmail.com</a>
+            <button type="button" className="supportFeedback" onClick={() => {setFeedbackError(""); setFeedbackOpen(true);}}>Send product feedback</button>
           </div>
         </div>
         <button
@@ -941,6 +1034,7 @@ function App(){
         </div>
       </main>
       {profileOpen && <ProfileDialog profile={profile} telegramConfig={telegramConfig} onSave={saveProfile} onTestTelegram={(settings) => notifyTelegram("TradeMind Telegram connection test successful.", settings)} onClose={() => setProfileOpen(false)} />}
+      {feedbackOpen && <div className="profileDialogBackdrop" onMouseDown={(event) => {if (event.target === event.currentTarget) setFeedbackOpen(false);}}><form className="profileDialog feedbackDialog" onSubmit={submitFeedback} role="dialog" aria-modal="true" aria-labelledby="feedback-dialog-title"><div className="panelHead"><div><p className="eyebrow">TRADEMIND FEEDBACK</p><h2 id="feedback-dialog-title">Send feedback</h2></div><button className="popoverClose" type="button" aria-label="Close feedback form" onClick={() => setFeedbackOpen(false)}>Close</button></div><label>Category<select value={feedbackForm.category} onChange={(event) => setFeedbackForm((current) => ({...current, category: event.target.value}))}><option>Suggestion</option><option>Bug</option><option>Question</option><option>Other</option></select></label><label>Subject<input required minLength={3} maxLength={120} value={feedbackForm.subject} onChange={(event) => setFeedbackForm((current) => ({...current, subject: event.target.value}))} /></label><label>Message<textarea required minLength={5} maxLength={4000} rows={6} value={feedbackForm.message} onChange={(event) => setFeedbackForm((current) => ({...current, message: event.target.value}))} /></label>{feedbackError && <p className="warningText" role="alert">{feedbackError}</p>}{feedbackNotice && <p className="feedbackSuccess" role="status">{feedbackNotice}</p>}<div className="profileDialogActions"><button className="outline" type="button" onClick={() => setFeedbackOpen(false)}>Cancel</button><button className="primary" disabled={feedbackBusy}>{feedbackBusy ? "Sending…" : "Send feedback"}</button></div></form></div>}
       {selectedNotification && (
         <div className="profileDialogBackdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setSelectedNotification(null);
@@ -1726,11 +1820,11 @@ function Backtesting({backtest, backtestError, runBacktest, symbol, backtestForm
             <option value="1m">1 minute</option><option value="2m">2 minutes</option><option value="5m">5 minutes</option><option value="15m">15 minutes</option><option value="30m">30 minutes</option><option value="60m">60 minutes</option><option value="90m">90 minutes</option><option value="1h">1 hour</option><option value="1d">1 day</option><option value="5d">5 days</option><option value="1wk">1 week</option><option value="1mo">1 month</option><option value="3mo">3 months</option>
           </select></label>
           <label>Duration<div className="durationInputGroup"><input aria-label="Duration amount" type="number" min="1" max={maxDurationForUnit(backtestForm.timeframe, backtestForm.durationUnit)} step="1" required value={backtestForm.durationValue} onChange={(event) => setBacktestForm((current) => ({...current, durationValue: event.target.value}))} /><select aria-label="Duration unit" value={backtestForm.durationUnit} onChange={(event) => setBacktestForm((current) => ({...current, durationUnit: event.target.value, durationValue: "1"}))}><option value="days">Days</option><option value="months" disabled={!maxDurationForUnit(backtestForm.timeframe, "months")}>Months</option><option value="years" disabled={!maxDurationForUnit(backtestForm.timeframe, "years")}>Years</option></select></div></label>
-          <label>Initial capital<input type="number" value={backtestForm.initialCapital} onChange={(event) => setBacktestForm((current) => ({...current, initialCapital: event.target.value}))} /></label>
-          <label>Position budget (₹)<input type="number" min="1" value={backtestForm.positionSize} onChange={(event) => setBacktestForm((current) => ({...current, positionSize: event.target.value}))} /></label>
-          <label>Protective stop loss (%)<input type="number" min="0" step="0.1" value={backtestForm.stopLoss} onChange={(event) => setBacktestForm((current) => ({...current, stopLoss: event.target.value}))} /></label>
-          <label>Take-profit target (R)<input type="number" min="0.1" max="100" step="0.1" value={backtestForm.takeProfitRR || ""} onChange={(event) => setBacktestForm((current) => ({...current, takeProfitRR: event.target.value}))} /><small>Optional per-run override; blank uses the saved custom target when applicable.</small></label>
-          <label>Estimated fee per side (bps)<input type="number" min="0" max="1000" step="1" value={backtestForm.feeBps || "10"} onChange={(event) => setBacktestForm((current) => ({...current, feeBps: event.target.value}))} /></label>
+          <label>Initial capital<input type="number" min="0.01" step="any" required value={backtestForm.initialCapital} onChange={(event) => setBacktestForm((current) => ({...current, initialCapital: event.target.value}))} /></label>
+          <label>Position budget (₹)<input type="number" min="0.01" step="any" required value={backtestForm.positionSize} onChange={(event) => setBacktestForm((current) => ({...current, positionSize: event.target.value}))} /></label>
+          <label>Protective stop loss (%)<input type="number" min="0" max="100" step="any" required value={backtestForm.stopLoss} onChange={(event) => setBacktestForm((current) => ({...current, stopLoss: event.target.value}))} /></label>
+          <label>Take-profit target (R)<input type="number" min="0.01" max="100" step="any" value={backtestForm.takeProfitRR || ""} onChange={(event) => setBacktestForm((current) => ({...current, takeProfitRR: event.target.value}))} /><small>Optional per-run override; blank uses the saved custom target when applicable.</small></label>
+          <label>Estimated fee per side (bps)<input type="number" min="0" max="1000" step="any" value={backtestForm.feeBps || "10"} onChange={(event) => setBacktestForm((current) => ({...current, feeBps: event.target.value}))} /></label>
         </div>
       </div>
       {backtestError && <p className="warningText" role="alert">{backtestError}</p>}
@@ -1882,10 +1976,10 @@ function Strategies({strategies, saveStrategy, removeStrategy, onBacktest, saved
       <div className="panelHead"><h3>{title}</h3><label>Combine<select value={draft[logicName]} onChange={(event) => setDraft((current) => ({...current, [logicName]: event.target.value}))}><option value="AND">All (AND)</option><option value="OR">Any (OR)</option></select></label></div>
       {rows.map((condition, index) => <div className="conditionRow" key={`${groupName}-${index}`}>
         <label>Left<select value={condition.leftIndicator} onChange={(event) => updateCondition(groupName, index, "leftIndicator", event.target.value)}>{indicatorChoices.map((item) => <option key={item}>{item}</option>)}</select></label>
-        {indicatorNeedsPeriod(condition.leftIndicator) && <label>Period<input type="number" min="1" max="500" value={condition.leftPeriod} onChange={(event) => updateCondition(groupName, index, "leftPeriod", event.target.value)} /></label>}
+        {indicatorNeedsPeriod(condition.leftIndicator) && <label>Period<input type="number" min="1" max="500" step="1" value={condition.leftPeriod} onChange={(event) => updateCondition(groupName, index, "leftPeriod", event.target.value)} /></label>}
         <label>Operator<select value={condition.operator} onChange={(event) => updateCondition(groupName, index, "operator", event.target.value)}>{operatorChoices.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
         <label>Compare to<select value={condition.rightMode} onChange={(event) => updateCondition(groupName, index, "rightMode", event.target.value)}><option value="indicator">Indicator</option><option value="value">Number</option></select></label>
-        {condition.rightMode === "indicator" ? <><label>Right<select value={condition.rightIndicator} onChange={(event) => updateCondition(groupName, index, "rightIndicator", event.target.value)}>{indicatorChoices.map((item) => <option key={item}>{item}</option>)}</select></label>{indicatorNeedsPeriod(condition.rightIndicator) && <label>Period<input type="number" min="1" max="500" value={condition.rightPeriod} onChange={(event) => updateCondition(groupName, index, "rightPeriod", event.target.value)} /></label>}</> : <label>Value<input type="number" step="any" value={condition.rightValue} onChange={(event) => updateCondition(groupName, index, "rightValue", event.target.value)} /></label>}
+        {condition.rightMode === "indicator" ? <><label>Right<select value={condition.rightIndicator} onChange={(event) => updateCondition(groupName, index, "rightIndicator", event.target.value)}>{indicatorChoices.map((item) => <option key={item}>{item}</option>)}</select></label>{indicatorNeedsPeriod(condition.rightIndicator) && <label>Period<input type="number" min="1" max="500" step="1" value={condition.rightPeriod} onChange={(event) => updateCondition(groupName, index, "rightPeriod", event.target.value)} /></label>}</> : <label>Value<input type="number" step="any" value={condition.rightValue} onChange={(event) => updateCondition(groupName, index, "rightValue", event.target.value)} /></label>}
         <button className="iconButton" type="button" aria-label={`Remove ${title.toLowerCase()} condition ${index + 1}`} onClick={() => setDraft((current) => ({...current, [groupName]: current[groupName].filter((_, conditionIndex) => conditionIndex !== index)}))} disabled={rows.length === 1}>Remove</button>
       </div>)}
       <button className="outline" type="button" onClick={() => setDraft((current) => ({...current, [groupName]: [...current[groupName], blankCondition()]}))} disabled={rows.length >= 100}>Add condition</button>
@@ -1927,7 +2021,7 @@ function Strategies({strategies, saveStrategy, removeStrategy, onBacktest, saved
           </div></section>
           {conditionEditor("Entry conditions", "entryConditions", "entryLogic")}
           {conditionEditor("Exit conditions", "exitConditions", "exitLogic")}
-          <details className="builderAdvanced" open={showAdvanced} onToggle={(event) => setShowAdvanced(event.currentTarget.open)}><summary>Risk and execution settings</summary><div className="builderGrid"><label>Protective stop loss (%)<input type="number" min="0.01" max="100" step="0.1" value={draft.stopLossPct} onChange={(event) => setDraft((current) => ({...current, stopLossPct: event.target.value}))} /></label><label>Target risk multiple<input type="number" min="0.1" step="0.1" value={draft.targetR} onChange={(event) => setDraft((current) => ({...current, targetR: event.target.value}))} /></label></div></details>
+          <details className="builderAdvanced" open={showAdvanced} onToggle={(event) => setShowAdvanced(event.currentTarget.open)}><summary>Risk and execution settings</summary><div className="builderGrid"><label>Protective stop loss (%)<input type="number" min="0.01" max="100" step="any" value={draft.stopLossPct} onChange={(event) => setDraft((current) => ({...current, stopLossPct: event.target.value}))} /></label><label>Target risk multiple<input type="number" min="0.01" step="any" value={draft.targetR} onChange={(event) => setDraft((current) => ({...current, targetR: event.target.value}))} /></label></div></details>
           <section className="logicPreview"><p className="eyebrow">LOGIC PREVIEW</p><h3>{draft.name || "Untitled strategy"}</h3><p><b>Entry ({draft.entryLogic}):</b> {draft.entryConditions.map(describe).join(draft.entryLogic === "AND" ? " AND " : " OR ")}</p><p><b>Exit ({draft.exitLogic}):</b> {draft.exitConditions.map(describe).join(draft.exitLogic === "AND" ? " AND " : " OR ")}</p><p><b>Risk:</b> {draft.stopLossPct}% protective stop · {draft.targetR}R target · {draft.direction} only · {draft.timeframe}</p></section>
           <div className="builderFooter"><button className="outline" type="button" onClick={() => setValidationMessage(validateDraft())}>Validate rules</button><span role="status">{validationMessage}</span><button className="primary" type="submit" disabled={saving}>{saving ? "Saving…" : draft.id ? "Save new version" : "Save strategy"}</button></div>
           {saveError && <p className="warningText" role="alert">{saveError}</p>}
