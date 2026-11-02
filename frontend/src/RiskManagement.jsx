@@ -1,5 +1,4 @@
 import React, {useEffect, useMemo, useState} from "react";
-import {AlertTriangle, CheckCircle2, ShieldAlert, ShieldCheck} from "lucide-react";
 import "./risk-management.css";
 
 const API = "/api";
@@ -55,13 +54,6 @@ async function responseJson(response){
   return body;
 }
 
-function statusKind(status){
-  if (!status || status === "UNAVAILABLE") return "warning";
-  if (status === "LIMIT REACHED") return "limit";
-  if (status === "WARNING") return "warning";
-  return "safe";
-}
-
 function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLoggedIn}){
   const [instrument, setInstrument] = useState(INSTRUMENTS[0].value);
   const [direction, setDirection] = useState("BUY");
@@ -74,15 +66,13 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
   const [feeBps, setFeeBps] = useState("0");
   const [slippage, setSlippage] = useState("0");
   const [marginPct, setMarginPct] = useState("");
-  const [positions, setPositions] = useState([]);
-  const [status, setStatus] = useState(null);
+  const [riskSnapshot, setRiskSnapshot] = useState(null);
   const [loadError, setLoadError] = useState("");
   const [saveError, setSaveError] = useState("");
   const [toast, setToast] = useState("");
   const [saving, setSaving] = useState(false);
   const [recording, setRecording] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
-  const [pnlDrafts, setPnlDrafts] = useState({});
 
   const settings = {
     ...DEFAULTS,
@@ -112,10 +102,10 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
     : Number(settings.dailyLossValue) || 0;
   const overallLimit = equity * (Number(settings.maxDrawdownPct) || 0) / 100;
   const openRiskLimit = equity * (Number(settings.maxOpenRiskPct) || 0) / 100;
-  const dailyRemaining = status ? Math.max(0, dailyLimit - Number(status.daily_loss_used || 0)) : dailyLimit;
-  const overallRemaining = status ? Math.max(0, overallLimit - Number(status.overall_loss_used || 0)) : overallLimit;
-  const openRiskRemaining = status ? Math.max(0, openRiskLimit - Number(status.current_open_risk || 0)) : openRiskLimit;
-  const tradeCountLimitReached = Boolean(status && settings.maxTradesPerDay !== "" && settings.maxTradesPerDay != null && status.trades_today >= Number(settings.maxTradesPerDay));
+  const dailyRemaining = riskSnapshot ? Math.max(0, dailyLimit - Number(riskSnapshot.daily_loss_used || 0)) : dailyLimit;
+  const overallRemaining = riskSnapshot ? Math.max(0, overallLimit - Number(riskSnapshot.overall_loss_used || 0)) : overallLimit;
+  const openRiskRemaining = riskSnapshot ? Math.max(0, openRiskLimit - Number(riskSnapshot.current_open_risk || 0)) : openRiskLimit;
+  const tradeCountLimitReached = Boolean(riskSnapshot && settings.maxTradesPerDay !== "" && settings.maxTradesPerDay != null && riskSnapshot.trades_today >= Number(settings.maxTradesPerDay));
   const maxRiskBudget = tradeCountLimitReached ? 0 : Math.max(0, Math.min(tradeLimit, dailyRemaining, overallRemaining, openRiskRemaining));
 
   const selectedInstrument = INSTRUMENTS.find((item) => item.value === instrument) || INSTRUMENTS[0];
@@ -175,22 +165,21 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
     };
   }, [selectedInstrument, direction, entryPrice, stopPrice, targetPrice, contractMultiplier, quantityStep, plannedQuantity, feeBps, slippage, marginPct, maxRiskBudget, equity]);
 
-  async function refreshProtection(){
-    if (!isLoggedIn) return;
+  async function refreshRiskLimits(){
+    if (!isLoggedIn) {
+      setRiskSnapshot(null);
+      return;
+    }
     try {
-      const [nextStatus, nextPositions] = await Promise.all([
-        fetch(`${API}/risk/status`).then(responseJson),
-        fetch(`${API}/risk/positions`).then(responseJson)
-      ]);
-      setStatus(nextStatus);
-      setPositions(nextPositions);
+      setRiskSnapshot(await fetch(`${API}/risk/status`).then(responseJson));
       setLoadError("");
     } catch (error) {
+      setRiskSnapshot(null);
       setLoadError(error.message);
     }
   }
 
-  useEffect(() => { refreshProtection(); }, [isLoggedIn]);
+  useEffect(() => { refreshRiskLimits(); }, [isLoggedIn]);
 
   async function submitSettings(event){
     event.preventDefault();
@@ -214,7 +203,7 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
       setToast("Account risk settings saved.");
       setSettingsDirty(false);
       addLog("Account risk settings saved.", "success");
-      await refreshProtection();
+      await refreshRiskLimits();
     } catch (error) {
       setSaveError(error.message);
     } finally {
@@ -246,9 +235,9 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
         })
       }));
       setToast("Position added to your manual risk journal.");
-      addLog(`Manual ${direction} position recorded for ${instrument}.`, "success");
+      addLog(`Manual ${direction} position recorded for ${instrument} after server-side risk checks.`, "success");
       setPlannedQuantity("");
-      await refreshProtection();
+      await refreshRiskLimits();
     } catch (error) {
       const detail = error.detail;
       setLoadError(detail?.reasons ? `${error.message} ${detail.reasons.join(" ")} Maximum permitted risk: ${money(detail.maximum_permitted_risk, settings.currency)}.` : error.message);
@@ -257,38 +246,13 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
     }
   }
 
-  async function updatePosition(position, close){
-    const enteredPnl = pnlDrafts[position.id];
-    if (enteredPnl === undefined || enteredPnl === "" || !Number.isFinite(Number(enteredPnl))) {
-      setLoadError("Enter a valid manual P&L amount first.");
-      return;
-    }
-    try {
-      await responseJson(await fetch(`${API}/risk/positions/${position.id}`, {
-        method: "PUT",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(close ? {close: true, realized_pnl: Number(enteredPnl)} : {unrealized_pnl: Number(enteredPnl)})
-      }));
-      setToast(close ? "Position closed in your manual journal." : "Manual unrealized P&L updated.");
-      await refreshProtection();
-    } catch (error) {
-      setLoadError(error.message);
-    }
-  }
-
-  const statusLevel = !status ? "UNAVAILABLE" : status.blocked || status.daily_status === "LIMIT REACHED" || status.overall_status === "LIMIT REACHED"
-    ? "LIMIT REACHED"
-    : status.daily_status === "WARNING" || status.overall_status === "WARNING"
-      ? "WARNING"
-      : "SAFE";
-  const StatusIcon = statusLevel === "SAFE" ? ShieldCheck : statusLevel === "WARNING" ? AlertTriangle : ShieldAlert;
   const tradeCanBeRecorded = isLoggedIn && !settingsDirty && calculation && !calculation.error && calculation.quantity > 0 && !calculation.plannedOverLimit && calculation.quantityIsStepValid;
 
   return (
     <div className="riskPage">
       <header className="riskPageHeading">
         <div><p className="eyebrow">CAPITAL PROTECTION</p><h1>Risk Management</h1><p>Plan each position against the limits you set for this account.</p></div>
-        <span className="riskDataTag">{isLoggedIn ? "ACCOUNT JOURNAL" : "SIGN IN TO SAVE"}</span>
+        <span className="riskDataTag">{isLoggedIn ? "ACCOUNT SETTINGS" : "SIGN IN TO SAVE"}</span>
       </header>
 
       <section className="riskSection" aria-labelledby="risk-settings-title">
@@ -338,6 +302,7 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
             </>}
             {calculation.plannedOverLimit && <div className="riskTradeWarning" role="alert"><b>{calculation.plannedOverCapital ? "CAPITAL / MARGIN LIMIT EXCEEDED" : "TRADE RISK TOO HIGH"}</b><span>{calculation.plannedOverCapital ? "Planned quantity exceeds the capital or margin capacity used by this estimate." : `Planned loss is ${money(calculation.plannedRisk, settings.currency)}; the currently allowed risk is ${money(maxRiskBudget, settings.currency)}.`} Reduce quantity to {Number(calculation.maximumQuantity.toFixed(8)).toLocaleString()} or less. The stop is not changed.</span></div>}
             {!calculation.quantityIsStepValid && <p className="riskError" role="alert">Planned quantity must be a whole multiple of the configured lot or quantity step.</p>}
+            {loadError && <p className="riskError" role="alert">{loadError}</p>}
             <button type="button" className="primary riskRecordButton" disabled={!tradeCanBeRecorded || recording} onClick={recordPosition}>{recording ? "Checking limits…" : "Add as open manual position"}</button>
             {!isLoggedIn && <small className="riskMuted">Sign in to save positions and use server-side checks.</small>}
             {settingsDirty && <small className="riskMuted">Save changed account limits before recording a position.</small>}
@@ -345,22 +310,6 @@ function RiskManagement({riskRules, setRiskRules, saveRiskRules, addLog, isLogge
         </div>
       </section>
 
-      <section className="riskSection" aria-labelledby="risk-status-title">
-        <div className="riskSectionHeading"><span className="riskSectionIndex">03</span><div><h2 id="risk-status-title">Account Protection Status</h2><p>Manual journal totals only. TradeMind is not connected to a broker and cannot stop external orders.</p></div></div>
-        <div className={`riskStatusBanner ${statusKind(statusLevel)}`}><StatusIcon size={20} aria-hidden="true" /><div><b>{statusLevel}</b><span>{statusLevel === "SAFE" ? "Recorded values are within configured limits." : statusLevel === "WARNING" ? "A configured loss or open-risk allowance is getting close." : statusLevel === "UNAVAILABLE" ? "Sign in to load this account’s protection status." : "A configured limit is reached. New journal positions are blocked."}</span></div><span className="riskStatusSource">Manual / advisory</span></div>
-        {loadError && <p className="riskError" role="alert">{loadError}</p>}
-        <div className="riskProtectionGrid">
-          <div><span>Today realized P&amp;L</span><strong className={Number(status?.today_realized_pnl) < 0 ? "riskNegative" : ""}>{status ? money(status.today_realized_pnl, settings.currency) : "—"}</strong><small>Closed positions recorded in this trading day</small></div>
-          <div><span>Today unrealized P&amp;L</span><strong className={Number(status?.open_unrealized_pnl) < 0 ? "riskNegative" : ""}>{status ? money(status.open_unrealized_pnl, settings.currency) : "—"}</strong><small>Manually entered for open positions</small></div>
-          <div><span>Daily limit remaining</span><strong>{status ? money(status.daily_remaining, settings.currency) : money(dailyLimit, settings.currency)}</strong><small>Daily limit: {money(dailyLimit, settings.currency)}</small></div>
-          <div><span>Current open-position risk</span><strong>{status ? money(status.current_open_risk, settings.currency) : money(0, settings.currency)}</strong><small>Open stop risks from this journal</small></div>
-          <div><span>Overall loss allowance remaining</span><strong>{status ? money(status.overall_remaining, settings.currency) : money(overallLimit, settings.currency)}</strong><small>Configured maximum: {money(overallLimit, settings.currency)}</small></div>
-          <div><span>Open-risk budget remaining</span><strong>{status ? money(status.open_risk_remaining, settings.currency) : money(openRiskLimit, settings.currency)}</strong><small>Maximum simultaneous risk: {money(openRiskLimit, settings.currency)}</small></div>
-        </div>
-        <div className="riskJournalHead"><div><h3>Manual position journal</h3><span>{status?.trades_today ?? 0} trades recorded today · day starts {settings.tradingDayStart} ({settings.tradingTimezone})</span></div><button type="button" className="riskRefreshButton" onClick={refreshProtection} disabled={!isLoggedIn}><CheckCircle2 size={15} /> Refresh</button></div>
-        {positions.length ? <div className="riskPositionsTable"><div className="riskPositionHeader"><span>Position</span><span>Size / risk</span><span>Manual P&amp;L</span><span>Action</span></div>{positions.map((position) => <div className="riskPositionRow" key={position.id}><div><b>{position.direction} · {position.instrument}</b><small>{position.entry_price} entry · {position.stop_price} stop · {position.status} · {new Date(position.opened_at).toLocaleString()}</small></div><div>{position.quantity.toLocaleString()} units<small>Risk {money(position.risk_amount, settings.currency)}</small></div><div>{position.status === "open" ? <input aria-label={`Manual P&L for ${position.instrument}`} type="number" step="any" value={pnlDrafts[position.id] ?? position.unrealized_pnl} onChange={(event) => setPnlDrafts((current) => ({...current, [position.id]: event.target.value}))} /> : <b>{money(position.realized_pnl, settings.currency)}</b>}</div><div>{position.status === "open" ? <><button type="button" className="riskSmallButton" onClick={() => updatePosition(position, false)}>Update P&amp;L</button><button type="button" className="riskSmallButton close" onClick={() => updatePosition(position, true)}>Close</button></> : <span className="riskClosedLabel">Closed</span>}</div></div>)}</div> : <div className="riskEmptyJournal">No manual positions recorded. A valid calculator result can be added to start tracking open risk and P&amp;L.</div>}
-        <p className="riskManualNote">{status?.data_mode || "No broker integration is connected. Values are not live account data."} Daily history is retained; only the active trading-day summary changes at the configured boundary.</p>
-      </section>
     </div>
   );
 }
