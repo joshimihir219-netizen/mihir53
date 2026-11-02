@@ -354,6 +354,36 @@ class AuthenticationFlowTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "administrator already exists"):
             promote_admin.promote_first_admin("marketpilot")
 
+    def test_environment_bootstrap_creates_hashed_admin_and_login_works(self):
+        with patch.dict(os.environ, {
+            "TRADEMIND_INITIAL_ADMIN_USERNAME": "firstadmin",
+            "TRADEMIND_INITIAL_ADMIN_PASSWORD": "SecureInitialAdmin!48",
+        }):
+            self.assertEqual(promote_admin.create_first_admin_from_environment(), "firstadmin")
+        with main._auth_connection() as connection:
+            user = main._execute(connection, "SELECT password_salt, password_hash, role FROM users WHERE username = ?", ("firstadmin",)).fetchone()
+        self.assertEqual(user["role"], "ADMIN")
+        self.assertNotEqual(user["password_hash"], b"SecureInitialAdmin!48")
+        self.assertGreater(len(user["password_salt"]), 0)
+        login = self.client.post("/api/auth/login", json={"username": "firstadmin", "password": "SecureInitialAdmin!48"})
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.json()["role"], "ADMIN")
+        with patch.dict(os.environ, {
+            "TRADEMIND_INITIAL_ADMIN_USERNAME": "secondadmin",
+            "TRADEMIND_INITIAL_ADMIN_PASSWORD": "AnotherSecureAdmin!58",
+        }), self.assertRaisesRegex(RuntimeError, "administrator already exists"):
+            promote_admin.create_first_admin_from_environment()
+
+    def test_environment_bootstrap_requires_credentials_and_refuses_username_collision(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TRADEMIND_INITIAL_ADMIN_USERNAME", None)
+            os.environ.pop("TRADEMIND_INITIAL_ADMIN_PASSWORD", None)
+            with self.assertRaisesRegex(RuntimeError, "Set TRADEMIND_INITIAL_ADMIN_USERNAME"):
+                promote_admin.create_first_admin_from_environment()
+        self.login_user()
+        with self.assertRaisesRegex(RuntimeError, "already belongs to an account"):
+            promote_admin.create_first_admin("marketpilot", "SecureInitialAdmin!48")
+
     def test_admin_strategy_publication_user_status_feedback_and_audit(self):
         self.login_user()
         promote_admin.promote_first_admin("marketpilot")

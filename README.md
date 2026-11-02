@@ -92,16 +92,23 @@ The admin console is available at `/admin` on the same host as TradeMind (for ex
 
 After deploying the code, the backend applies additive migrations on startup: existing accounts receive the default `USER` role and `ACTIVE` status, existing strategies receive a private/unpublished flag, and admin activity, feedback, signal-history, and platform-settings tables are created if absent. Existing account and strategy data is preserved. No new Vercel environment variable is required beyond the existing persistent `DATABASE_URL` setting.
 
-To promote the first administrator, first create the account through the normal website, then run the CLI against the same database used by Vercel. Set `DATABASE_URL` in your local shell to the existing Neon connection string first; the command refuses to use local SQLite unless explicitly asked:
+To create the first administrator, run the CLI from `backend/` against the same Neon database used by Vercel. Set `DATABASE_URL` from your secure local secret store, then provide the temporary bootstrap username and password in your local shell. The password prompt below does not echo the password:
 
 ```bash
 cd backend
-DATABASE_URL="$DATABASE_URL" python promote_admin.py existing_username
+export DATABASE_URL="<existing Neon connection string>"
+export TRADEMIND_INITIAL_ADMIN_USERNAME="<chosen admin username>"
+printf 'Initial admin password: '
+read -rs TRADEMIND_INITIAL_ADMIN_PASSWORD
+printf '\n'
+export TRADEMIND_INITIAL_ADMIN_PASSWORD
+python promote_admin.py
+unset TRADEMIND_INITIAL_ADMIN_USERNAME TRADEMIND_INITIAL_ADMIN_PASSWORD
 ```
 
-For a local-only development account, use `python promote_admin.py --local existing_username`.
+Supply the values to those environment variables locally using your shell or secret manager; do not put credentials in source files or Vercel's persistent runtime environment. The password must be 12-128 characters and is stored only as the application's salted PBKDF2-SHA256 hash. The script refuses to overwrite an existing username or run if an administrator already exists. To promote an already registered user instead, run `python promote_admin.py existing_username` against the same database. Local SQLite requires the explicit `--local` option.
 
-The command promotes only an existing active account and refuses to run if any administrator already exists. Keep `DATABASE_URL` in the shell environment; do not put database credentials in source code or commit them. After promotion, sign in with that account and visit `/admin`. Further role changes are available only in the protected user-management screen; administrators cannot change their own role or lock themselves out, and the last active administrator cannot be suspended or demoted.
+After creation or promotion, visit `/admin` and sign in with that account. The admin sign-in screen reuses the existing username/password session service, but is separate from public signup. Further role changes are available only in the protected user-management screen; administrators cannot change their own role or lock themselves out, and the last active administrator cannot be suspended or demoted.
 
 The console manages existing users, stored strategies and backtests, provider-backed signal checks, platform risk defaults, feedback, and administrator activity. Published strategies appear in users' strategy lists but remain read-only to their owners. Signal snapshots are stored only when real provider candles are available; unavailable markets show `NO DATA`. Feedback is submitted from the user sidebar and can be triaged in the console. Platform risk defaults do not overwrite individual account risk settings.
 
