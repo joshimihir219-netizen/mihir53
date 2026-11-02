@@ -116,6 +116,10 @@ function passwordStrength(password){
   return {score, label: score <= 2 ? "Weak" : score <= 3 ? "Fair" : "Strong"};
 }
 
+function isAdminPath(pathname){
+  return pathname === "/admin" || pathname.startsWith("/admin/");
+}
+
 function App(){
   const [page, setPage] = useState("Dashboard");
   const [appPath, setAppPath] = useState(() => window.location.pathname);
@@ -261,10 +265,6 @@ function App(){
         if (cancelled) return;
         setUserId(account.user_id);
         setUserRole(account.role || "USER");
-        if (window.location.pathname.startsWith("/admin") && account.role !== "ADMIN") {
-          window.history.replaceState({}, "", "/");
-          setAppPath("/");
-        }
         localStorage.removeItem("trademind-auth-session");
         localStorage.removeItem("trademind-session");
         localStorage.setItem("trademind-user", JSON.stringify({username: account.username}));
@@ -729,10 +729,6 @@ function App(){
         localStorage.setItem("trademind-user", JSON.stringify({username: result.username}));
         setUserRole(result.role || "USER");
         setUserId(result.user_id);
-        if (window.location.pathname.startsWith("/admin") && result.role !== "ADMIN") {
-          window.history.replaceState({}, "", "/");
-          setAppPath("/");
-        }
         setProfile((current) => ({
           ...current,
           name: current.name === "TradeMind User" || current.name === loginForm.username ? result.username : current.name
@@ -767,7 +763,7 @@ function App(){
     setIsLoggedIn(false);
     setUserRole("USER");
     setUserId(null);
-    if (window.location.pathname.startsWith("/admin")) {
+    if (isAdminPath(window.location.pathname)) {
       window.history.replaceState({}, "", "/");
       setAppPath("/");
     }
@@ -869,12 +865,14 @@ function App(){
     return <div className="loginShell"><div className="loginCard"><p role="status">Checking your account session…</p></div></div>;
   }
 
-  if (isLoggedIn && appPath.startsWith("/admin")) {
+  const isAdminRoute = isAdminPath(appPath);
+
+  if (isAdminRoute && isLoggedIn) {
     if (userRole !== "ADMIN") {
-      return <div className="loginShell"><div className="loginCard"><h1>Access denied</h1><p>Your account does not have administrator access.</p><button className="primary" onClick={() => navigatePath("/")}>Return to TradeMind</button></div></div>;
+      return <div className="loginShell"><div className="loginCard"><div className="brand"><div className="brandIcon">AI</div><div><b>TradeMind</b><small>ADMIN CONSOLE</small></div></div><h1>Access denied</h1><p>Your account does not have administrator access. Sign in with an administrator-enabled account to continue.</p><button className="primary full" onClick={() => navigatePath("/")}>Return to TradeMind</button></div></div>;
     }
     const savedUser = JSON.parse(localStorage.getItem("trademind-user") || "null");
-    return <AdminPanel username={savedUser?.username || profile.name} currentAdminId={userId} onLogout={handleLogout} onReturnToWebsite={() => navigatePath("/")} onAccessDenied={() => {setUserRole("USER"); navigatePath("/");}} />;
+    return <AdminPanel username={savedUser?.username || profile.name} currentAdminId={userId} onLogout={handleLogout} onReturnToWebsite={() => navigatePath("/")} onAccessDenied={() => setUserRole("USER")} />;
   }
 
   if (!isLoggedIn) {
@@ -883,19 +881,19 @@ function App(){
       <div className="loginShell authShell">
         <div className="loginCard authCard">
           <div className="brand"><div className="brandIcon">AI</div><div><b>TradeMind</b><small>AI Trading Lab</small></div></div>
-          <div className="authToggle" role="tablist" aria-label="Account access">
+          {!isAdminRoute && <div className="authToggle" role="tablist" aria-label="Account access">
             <button type="button" role="tab" aria-selected={authMode === "login"} className={authMode === "login" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button>
             <button type="button" role="tab" aria-selected={authMode === "signup"} className={authMode === "signup" ? "toggle active" : "toggle"} onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Sign up</button>
-          </div>
-          <h1>{authMode === "login" ? "Welcome back" : "Create your account"}</h1>
-          <p className="authDescription">{authMode === "login" ? "Sign in to your trading workspace." : "Choose a username and secure password."}</p>
+          </div>}
+          <h1>{isAdminRoute ? "Admin sign in" : authMode === "login" ? "Welcome back" : "Create your account"}</h1>
+          <p className="authDescription">{isAdminRoute ? "Use an existing administrator-enabled TradeMind account." : authMode === "login" ? "Sign in to your trading workspace." : "Choose a username and secure password."}</p>
           {authMessage && <div className="authMessage" role="status"><CheckCircle2 size={17} /> <span>{authMessage}</span></div>}
           <form onSubmit={handleLogin} className="loginForm authForm">
             {authMode === "login" && <>
               <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Your username" /></label>
               <label>Password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="current-password" minLength={8} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="Your password" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
             </>}
-            {authMode === "signup" && <>
+            {!isAdminRoute && authMode === "signup" && <>
               <label>Username<input autoComplete="username" minLength={3} maxLength={50} required value={loginForm.username} onChange={(event) => setLoginForm((current) => ({...current, username: event.target.value}))} placeholder="Choose a username" /></label>
               <label>Password<div className="authPasswordWrap"><input type={passwordVisible ? "text" : "password"} autoComplete="new-password" minLength={12} maxLength={128} required value={loginForm.password} onChange={(event) => setLoginForm((current) => ({...current, password: event.target.value}))} placeholder="At least 12 characters" /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
               {loginForm.password && <div className={`passwordStrength strength-${strength.score}`}><div><span style={{width: `${strength.score * 20}%`}} /></div><small>Password strength: {strength.label}</small></div>}
@@ -907,8 +905,8 @@ function App(){
               {authBusy ? "Please wait…" : authMode === "login" ? "Log in" : "Create account"}
             </button>
           </form>
-          {authMode === "login" && <p className="authFooter">New to TradeMind? <button type="button" className="authTextLink" onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Create an account</button></p>}
-          {authMode === "signup" && <p className="authFooter">Already registered? <button type="button" className="authTextLink" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button></p>}
+          {!isAdminRoute && authMode === "login" && <p className="authFooter">New to TradeMind? <button type="button" className="authTextLink" onClick={() => {setAuthMode("signup"); setLoginError(""); setAuthMessage("");}}>Create an account</button></p>}
+          {!isAdminRoute && authMode === "signup" && <p className="authFooter">Already registered? <button type="button" className="authTextLink" onClick={() => {setAuthMode("login"); setLoginError(""); setAuthMessage("");}}>Log in</button></p>}
         </div>
       </div>
     );
