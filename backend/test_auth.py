@@ -356,8 +356,8 @@ class AuthenticationFlowTests(unittest.TestCase):
 
     def test_environment_bootstrap_creates_hashed_admin_and_login_works(self):
         with patch.dict(os.environ, {
-            "TRADEMIND_INITIAL_ADMIN_USERNAME": "firstadmin",
-            "TRADEMIND_INITIAL_ADMIN_PASSWORD": "SecureInitialAdmin!48",
+            "ADMIN_USERNAME": "firstadmin",
+            "ADMIN_PASSWORD": "SecureInitialAdmin!48",
         }):
             self.assertEqual(promote_admin.create_first_admin_from_environment(), "firstadmin")
         with main._auth_connection() as connection:
@@ -376,13 +376,22 @@ class AuthenticationFlowTests(unittest.TestCase):
 
     def test_environment_bootstrap_requires_credentials_and_refuses_username_collision(self):
         with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ADMIN_USERNAME", None)
+            os.environ.pop("ADMIN_PASSWORD", None)
             os.environ.pop("TRADEMIND_INITIAL_ADMIN_USERNAME", None)
             os.environ.pop("TRADEMIND_INITIAL_ADMIN_PASSWORD", None)
-            with self.assertRaisesRegex(RuntimeError, "Set TRADEMIND_INITIAL_ADMIN_USERNAME"):
+            with self.assertRaisesRegex(RuntimeError, "Set ADMIN_USERNAME and ADMIN_PASSWORD"):
                 promote_admin.create_first_admin_from_environment()
         self.login_user()
         with self.assertRaisesRegex(RuntimeError, "already belongs to an account"):
             promote_admin.create_first_admin("marketpilot", "SecureInitialAdmin!48")
+
+    def test_legacy_admin_bootstrap_environment_names_still_work(self):
+        with patch.dict(os.environ, {
+            "TRADEMIND_INITIAL_ADMIN_USERNAME": "legacyadmin",
+            "TRADEMIND_INITIAL_ADMIN_PASSWORD": "LegacySecureAdmin!58",
+        }, clear=True):
+            self.assertEqual(promote_admin.create_first_admin_from_environment(), "legacyadmin")
 
     def test_admin_strategy_publication_user_status_feedback_and_audit(self):
         self.login_user()

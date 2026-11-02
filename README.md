@@ -92,21 +92,21 @@ The admin console is available at `/admin` on the same host as TradeMind (for ex
 
 After deploying the code, the backend applies additive migrations on startup: existing accounts receive the default `USER` role and `ACTIVE` status, existing strategies receive a private/unpublished flag, and admin activity, feedback, signal-history, and platform-settings tables are created if absent. Existing account and strategy data is preserved. No new Vercel environment variable is required beyond the existing persistent `DATABASE_URL` setting.
 
-To create the first administrator, run the CLI from `backend/` against the same Neon database used by Vercel. Set `DATABASE_URL` from your secure local secret store, then provide the temporary bootstrap username and password in your local shell. The password prompt below does not echo the password:
+To create the first administrator, run the CLI from `backend/` against the same Neon database used by Vercel. Keep the existing `DATABASE_URL` configured in Vercel. For the one-time setup, set that same connection string and the requested admin credentials in your local shell; do not add `ADMIN_PASSWORD` to Vercel's persistent runtime environment. The password prompt below does not echo the value:
 
 ```bash
 cd backend
 export DATABASE_URL="<existing Neon connection string>"
-export TRADEMIND_INITIAL_ADMIN_USERNAME="<chosen admin username>"
+export ADMIN_USERNAME="<chosen admin username>"
 printf 'Initial admin password: '
-read -rs TRADEMIND_INITIAL_ADMIN_PASSWORD
+read -rs ADMIN_PASSWORD
 printf '\n'
-export TRADEMIND_INITIAL_ADMIN_PASSWORD
+export ADMIN_PASSWORD
 python promote_admin.py
-unset TRADEMIND_INITIAL_ADMIN_USERNAME TRADEMIND_INITIAL_ADMIN_PASSWORD
+unset ADMIN_USERNAME ADMIN_PASSWORD
 ```
 
-Supply the values to those environment variables locally using your shell or secret manager; do not put credentials in source files or Vercel's persistent runtime environment. The password must be 12-128 characters and is stored only as the application's salted PBKDF2-SHA256 hash. The script refuses to overwrite an existing username or run if an administrator already exists. To promote an already registered user instead, run `python promote_admin.py existing_username` against the same database. Local SQLite requires the explicit `--local` option.
+Supply the values locally using your shell or secret manager; do not put credentials in source files or Vercel's persistent runtime environment. The password must be 12-128 characters and is stored only as the application's salted PBKDF2-SHA256 hash. The script refuses to overwrite an existing username or run if an administrator already exists. `TRADEMIND_INITIAL_ADMIN_USERNAME` and `TRADEMIND_INITIAL_ADMIN_PASSWORD` remain supported as backward-compatible aliases. To promote an already registered user instead, run `python promote_admin.py existing_username` against the same database. Local SQLite requires the explicit `--local` option.
 
 After creation or promotion, visit `/admin` and sign in with that account. The admin sign-in screen reuses the existing username/password session service, but is separate from public signup. Further role changes are available only in the protected user-management screen; administrators cannot change their own role or lock themselves out, and the last active administrator cannot be suspended or demoted.
 

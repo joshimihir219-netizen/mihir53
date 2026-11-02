@@ -55,10 +55,14 @@ def create_first_admin(username, password):
 
 
 def create_first_admin_from_environment():
-    username = os.environ.get("TRADEMIND_INITIAL_ADMIN_USERNAME", "")
-    password = os.environ.get("TRADEMIND_INITIAL_ADMIN_PASSWORD", "")
+    if "ADMIN_USERNAME" in os.environ or "ADMIN_PASSWORD" in os.environ:
+        username = os.environ.get("ADMIN_USERNAME", "")
+        password = os.environ.get("ADMIN_PASSWORD", "")
+    else:
+        username = os.environ.get("TRADEMIND_INITIAL_ADMIN_USERNAME", "")
+        password = os.environ.get("TRADEMIND_INITIAL_ADMIN_PASSWORD", "")
     if not username or not password:
-        raise RuntimeError("Set TRADEMIND_INITIAL_ADMIN_USERNAME and TRADEMIND_INITIAL_ADMIN_PASSWORD in the environment.")
+        raise RuntimeError("Set ADMIN_USERNAME and ADMIN_PASSWORD in the environment.")
     return create_first_admin(username, password)
 
 
